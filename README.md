@@ -5,9 +5,11 @@ SCSI/Link Ethernet protocol implemented by ZuluSCSI. The loadable image
 presents the adapter as `XQA0:`; TCP/IP Services sees the corresponding
 Ethernet interface as `QE0`.
 
-The current version is V0.61. It is experimental system software: it has been
-built and exercised on real hardware, including DHCP, ICMP, and bidirectional
-FTP, but it has not been qualified for production use.
+The current version is V0.62. It is experimental system software: the V0.61
+packet-I/O implementation has been built and exercised on real hardware,
+including DHCP, ICMP, and bidirectional FTP, but it has not been qualified for
+production use. V0.62 changes no packet-I/O behavior; it adds the native PCSI
+distribution and a compiler-independent installation path.
 
 ## Authorship
 
@@ -61,11 +63,17 @@ the ZuluSCSI terminator when an external terminator is already fitted.
 - `src/dp_vci_control.c` — privileged utility that installs or removes the
   VCI callback wrappers.
 - `VMS_BUILD.COM` — builds the driver and both runtime utilities.
+- `VMS_BUILD_PCSI.COM` — packages the built images as a sequential PCSI kit.
 - `VMS_DAYNAPORT_STARTUP.COM` — establishes the required boot order.
+- `kit/` — PCSI product metadata, installed startup procedure, safe IVP, and
+  administrator guide.
+- `dist/` — the verified prebuilt PCSI kit and its checksum.
 - `docs/architecture.md` — driver architecture and ownership model.
 - `docs/build-and-install.md` — complete build, install, SYSGEN, TCP/IP, and
   rollback procedure.
+- `docs/pcsi-kit.md` — PCSI contents, build boundary, and upgrade gate.
 - `docs/protocol.md` — DaynaPORT command and packet framing reference.
+- `CHANGELOG.md` — release history.
 
 ## Prerequisites
 
@@ -77,8 +85,32 @@ The build must run on OpenVMS VAX V7.3 with these installed components:
 - `SYS$SYSTEM:SYS.STB`;
 - a VAX C or Compaq C compiler compatible with `/STANDARD=VAXC`.
 
-No separately generated files are required. The repository contains every
-project source file and command procedure used by the release build.
+No separately generated source files are required. The repository contains
+every project source file and command procedure used by the release build.
+Installing the prebuilt PCSI kit does not require MACRO-32, C, or LINK.
+
+## Install the prebuilt PCSI kit
+
+The verified V0.62 full sequential kit is:
+
+```text
+dist/CHATGPT56-VAXVMS-DAYNAPORT-V0062--1.PCSI
+```
+
+Its size is 40960 bytes and its SHA-256 is
+`dc6ba7c8d6df9c7df6f55b013c3d58d17544bcb95d812747c7716742515cc503`.
+Copy it to the VAX in binary mode, set default to its directory, log in as
+SYSTEM, and run:
+
+```text
+$ PRODUCT INSTALL DAYNAPORT /SOURCE=[] /HELP
+```
+
+PCSI installs the prebuilt driver, both runtime utilities, startup procedure,
+safe IVP, installation guide, and license. The IVP validates files and image
+structure without loading the driver. Installation does not connect XQA0,
+change `USER4`, edit `SYSTARTUP_VMS.COM`, or configure TCP/IP. Read
+`SYS$HELP:DAYNAPORT$INSTALL.TXT` before enabling the driver at boot.
 
 ## Build
 
@@ -149,7 +181,8 @@ Installation modifies privileged system state and should be performed from a
 fully privileged SYSTEM account with a known-good system disk backup and a
 console available.
 
-At a high level:
+The recommended path is the prebuilt PCSI installation above. For a manual
+source build and installation, the high-level sequence is:
 
 1. Build the three images with `@VMS_BUILD.COM`.
 2. Copy `DYDRIVER.EXE` to `SYS$LOADABLE_IMAGES:`.
@@ -181,7 +214,7 @@ interface, remove a VCI hook, or shut down another network device.
 ## Current status and limitations
 
 V0.61 has passed native assembly/link/image analysis and repeated clean boot
-tests on the stated VAXstation. The tested path has completed:
+tests on the stated VAXstation. The unchanged packet-I/O path has completed:
 
 - automatic XQA0 connection and VCI publication;
 - DHCP configuration of QE0;
@@ -190,6 +223,12 @@ tests on the stated VAXstation. The tested path has completed:
 - receive-pool accounting with equal delivery and return totals;
 - zero receive-pool exhaustion with the 32-buffer default;
 - zero QE0 send and receive errors during the final bounded workload.
+
+V0.62 has passed a clean native build and PCSI V7.3-100 packaging gate. PCSI
+successfully upgraded the registered product from V0.61 to V0.62, and both the
+automatic and manual non-loading IVPs passed. The installed common driver
+identified as V0.62. This packaging gate deliberately did not replace or
+reload the resident node-specific V0.61 image; XQA0 and QE0 remained online.
 
 Known limitations:
 

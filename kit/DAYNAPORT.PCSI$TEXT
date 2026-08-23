@@ -1,0 +1,40 @@
+=product CHATGPT56 VAXVMS DAYNAPORT V0.62 full
+1 'PRODUCT
+=prompt DaynaPORT SCSI/Link driver for OpenVMS VAX
+The DaynaPORT product presents a ZuluSCSI DaynaPORT target as an OpenVMS
+Ethernet device for TCP/IP Services.
+1 'NOTICE
+=prompt Copyright (c) 2026 chatgpt5.6-sol and mlevitin.
+This software is experimental.  Keep a working console and a recoverable
+system disk available whenever loading a third-party kernel driver.
+1 'LICENSE
+=prompt Licensed under the MIT License.
+The full license is installed as SYS$HELP:DAYNAPORT$LICENSE.TXT.
+1 'PRODUCER
+=prompt chatgpt5.6-sol and mlevitin
+The driver was written by chatgpt5.6-sol with the active participation,
+hardware, testing, and engineering direction of mlevitin.
+1 PREINSTALL
+=prompt Install the experimental DaynaPORT V0.62 files?
+This full kit is for OpenVMS VAX V7.3 and the ZuluSCSI DaynaPORT target.
+The tested target is SCSI ID 4, LUN 0, on a VAXstation 4000-90.
+
+Installation copies the driver, runtime utilities, startup procedure,
+documentation, and IVP.  It does not load or connect the driver, change
+SYSGEN parameters, edit SYSTARTUP_VMS.COM, or change TCP/IP configuration.
+1 POSTINSTALL
+=prompt DaynaPORT files are installed; configuration and a reboot remain.
+Read SYS$HELP:DAYNAPORT$INSTALL.TXT before loading the driver.
+
+Verify that the site-reserved static SYSGEN parameter USER4 is not used by
+another local component.  USER4=0 selects the default receive pool of 32;
+values 8 through 128 select an explicit pool size.  A persistent change
+requires WRITE CURRENT and takes effect when the driver is next loaded.
+
+Configure TCP/IP Services interface QE0 for DHCP, then add this command to
+SYS$MANAGER:SYSTARTUP_VMS.COM immediately before TCPIP$STARTUP.COM:
+
+  $ @SYS$STARTUP:DAYNAPORT$STARTUP.COM
+
+Use a working system console for the first reboot and retain a known-good
+system disk backup.  The PCSI installation has not performed these steps.

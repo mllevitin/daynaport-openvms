@@ -23,6 +23,9 @@ VMS_BUILD.COM
 VMS_DAYNAPORT_STARTUP.COM
 ```
 
+The repository also includes a prebuilt full sequential PCSI kit. Installing
+that kit does not require the build tools or source files listed above.
+
 ## OpenVMS prerequisites
 
 The validated build environment is OpenVMS VAX V7.3 with:
@@ -70,6 +73,44 @@ $ ANALYZE/IMAGE DYDRIVER.EXE
 ```
 
 reports no image error.
+
+## Prebuilt PCSI installation
+
+The verified V0.62 artifact is:
+
+```text
+dist/CHATGPT56-VAXVMS-DAYNAPORT-V0062--1.PCSI
+```
+
+It is 40960 bytes. Verify its SHA-256 against `dist/SHA256SUMS`, transfer the
+file to OpenVMS in binary mode, set default to its directory, and run from a
+fully privileged SYSTEM account:
+
+```text
+$ PRODUCT INSTALL DAYNAPORT /SOURCE=[] /HELP
+```
+
+The full kit installs these components:
+
+```text
+SYS$LOADABLE_IMAGES:DYDRIVER.EXE
+SYS$STARTUP:DP_MAC_INIT.EXE
+SYS$STARTUP:DP_VCI_CONTROL.EXE
+SYS$STARTUP:DAYNAPORT$STARTUP.COM
+SYS$TEST:DAYNAPORT$IVP.COM
+SYS$HELP:DAYNAPORT$INSTALL.TXT
+SYS$HELP:DAYNAPORT$LICENSE.TXT
+```
+
+Its IVP checks the installed files and runs `ANALYZE/IMAGE` on the three
+images. It never loads, connects, or executes the driver. PCSI does not set
+`USER4`, configure QE0, or edit `SYSTARTUP_VMS.COM`; perform those
+node-specific steps only after reading the installed administrator guide.
+
+V0.62 was packaged with PCSI V7.3-100 and successfully upgraded an installed
+V0.61 full product. The V0.62 common image and both support images passed the
+automatic and manual IVPs with zero image errors. The upgrade did not reload
+the active node-specific driver.
 
 ## USER4 configuration
 
@@ -124,7 +165,7 @@ partial pool only when at least one VCRP exists. The LDC current count records
 the actual allocation. Failure before the first VCRP returns
 `SS$_INSFMEM`.
 
-## Stage files
+## Manual staging from a source build
 
 Preserve the previous `DYDRIVER.EXE` version for rollback. Then copy the new
 image:
@@ -261,8 +302,20 @@ active. A rejected removal is a safety result, not a condition to bypass.
 
 ## Rollback
 
-OpenVMS file versioning normally leaves the prior driver image available.
-Before the first boot, record which version is known good.
+For a PCSI installation, first remove the DaynaPORT invocation from
+`SYSTARTUP_VMS.COM` and perform a controlled reboot so no installed image or
+interface is active. Then remove the registered product with:
+
+```text
+$ PRODUCT REMOVE DAYNAPORT
+```
+
+Do not run `PRODUCT REMOVE` while XQA0 or QE0 is active. Keep the kit and a
+system disk backup until the post-removal boot has been verified.
+
+For a manual installation, OpenVMS file versioning normally leaves the prior
+driver image available. Before the first boot, record which version is known
+good.
 
 If the new image fails after OpenVMS starts far enough to reach DCL:
 

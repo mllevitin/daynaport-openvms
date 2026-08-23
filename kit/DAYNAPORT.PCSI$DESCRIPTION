@@ -1,0 +1,19 @@
+product CHATGPT56 VAXVMS DAYNAPORT V0.62 full ;
+
+information PREINSTALL confirm phase before with helptext ;
+
+software DEC VAXVMS VMS version required V7.3 ;
+
+file [SYS$LDR]DYDRIVER.EXE protection private ;
+file [SYS$STARTUP]DP_MAC_INIT.EXE protection execute ;
+file [SYS$STARTUP]DP_VCI_CONTROL.EXE protection execute ;
+file [SYS$STARTUP]DAYNAPORT$STARTUP.COM protection private ;
+file [SYSTEST]DAYNAPORT$IVP.COM protection execute ;
+file [SYSHLP]DAYNAPORT$INSTALL.TXT protection public ;
+file [SYSHLP]DAYNAPORT$LICENSE.TXT protection public ;
+
+execute test "@SYS$TEST:DAYNAPORT$IVP.COM" ;
+
+information POSTINSTALL phase after with helptext ;
+
+end product ;

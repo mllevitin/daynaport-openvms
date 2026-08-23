@@ -268,7 +268,7 @@ or DHCP activation. It does not attempt destructive recovery.
 
 ## Tested boundaries
 
-The V0.61 build has been tested with:
+The V0.61 packet-I/O build has been tested with:
 
 - automatic boot-time XQA0 connection;
 - a 32-entry default receive pool selected by `USER4=0`;
@@ -281,3 +281,9 @@ The final bounded workload reached 11 outstanding VCRPs, recorded no pool
 exhaustion, and reported zero QE0 send/receive errors. TCP receive-side
 reordering remained visible, so the architecture should not be considered
 performance-complete.
+
+V0.62 changes no packet-I/O behavior. Its release boundary was tested with a
+clean native assembly/link/image-analysis gate followed by PCSI V7.3-100
+packaging and an installed-product upgrade from V0.61. The automatic and
+manual non-loading IVPs passed, and the installed common image identified as
+V0.62. The upgrade intentionally did not reload the resident driver.

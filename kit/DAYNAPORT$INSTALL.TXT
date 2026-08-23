@@ -1,0 +1,112 @@
+DaynaPORT SCSI/Link driver V0.62 for OpenVMS VAX V7.3
+======================================================
+
+1. Scope and tested environment
+-------------------------------
+
+This kit contains a prebuilt experimental OpenVMS LAN port driver for the
+DaynaPORT SCSI/Link protocol implemented by ZuluSCSI.  It was developed and
+tested with:
+
+  OpenVMS VAX V7.3
+  VAXstation 4000-90 with 128 MB RAM
+  NCR 53C94 SCSI port PKA0
+  ZuluSCSI DaynaPORT target at SCSI ID 4, LUN 0 (GKA400)
+  TCP/IP Services for OpenVMS VAX V5.1
+  DHCP on interface QE0
+
+The installed driver image is SYS$LOADABLE_IMAGES:DYDRIVER.EXE.  At startup
+it is connected as XQA0 and discovered by TCP/IP Services as QE0.
+
+2. Installation
+---------------
+
+Log in as SYSTEM and install the sequential kit from its directory:
+
+  $ PRODUCT INSTALL DAYNAPORT /SOURCE=device:[directory]
+
+The installation verification procedure checks the installed files and image
+structures.  It deliberately does not load, connect, or execute the driver.
+
+3. SYSGEN USER4 receive-pool parameter
+--------------------------------------
+
+V0.62 reads the site-reserved static SYSGEN parameter USER4 once during
+controller initialization.  USER4 is system-wide and is not a private
+DaynaPORT namespace.  Before assigning it, verify that no other local product
+or site procedure uses USER4.
+
+  USER4=0       selects the compiled default of 32 receive buffers
+  USER4=8..128  selects that exact receive-buffer count
+  other values  safely select the compiled default of 32
+
+Inspect the current value:
+
+  $ MCR SYSGEN
+  SYSGEN> SHOW USER4
+  SYSGEN> EXIT
+
+To persist an explicit value for the next driver load or reboot:
+
+  $ MCR SYSGEN
+  SYSGEN> USE CURRENT
+  SYSGEN> SET USER4 32
+  SYSGEN> WRITE CURRENT
+  SYSGEN> EXIT
+
+The driver does not reread USER4 while XQA0 is active and cannot resize its
+resident nonpaged receive pool.  Setting USER4 to zero restores selection of
+the compiled default on the next load.  The PCSI kit never changes USER4.
+
+4. TCP/IP Services configuration
+--------------------------------
+
+Configure the TCP/IP Services interface QE0 for DHCP with the configuration
+procedure appropriate to the installed TCP/IP Services version.  The tested
+configuration persists a QE0 /DHCP record.  Confirm that the record exists
+before enabling automatic startup.
+
+The PCSI kit does not create, delete, or modify TCP/IP interfaces, addresses,
+routes, or DHCP configuration.
+
+5. System startup
+-----------------
+
+Keep a working console and a recoverable system disk available for the first
+boot of any third-party kernel driver.  Add the following line to
+SYS$MANAGER:SYSTARTUP_VMS.COM immediately before the existing invocation of
+TCPIP$STARTUP.COM:
+
+  $ @SYS$STARTUP:DAYNAPORT$STARTUP.COM
+
+The order is required: the procedure connects XQA0, obtains the adapter MAC
+address, and installs the VCI discovery hook before TCP/IP Services discovers
+QE0.  It does not alter persistent TCP/IP data.
+
+After a controlled reboot, verify:
+
+  $ SHOW DEVICE XQA0 /FULL
+  $ TCPIP SHOW INTERFACE QE0 /FULL
+  $ PRODUCT SHOW PRODUCT DAYNAPORT /FULL
+
+The tested ZuluSCSI marker is NE4.IMG, creating target ID 4, LUN 0.  Do not
+use SCSI ID 6 on a VAXstation 4000-90; it is reserved for the host adapter.
+
+6. Removal and rollback
+-----------------------
+
+Do not remove the product while XQA0 or QE0 is active.  First remove the
+DAYNAPORT$STARTUP invocation from SYSTARTUP_VMS.COM, restore a known-good boot
+configuration, and perform a controlled reboot so the installed image is no
+longer resident.  Then remove the registered product:
+
+  $ PRODUCT REMOVE DAYNAPORT
+
+PCSI removes only files owned by this kit.  Keep the original kit and a system
+disk backup until the post-removal boot has been verified.
+
+7. License and support status
+-----------------------------
+
+The software is licensed under the MIT License; see
+SYS$HELP:DAYNAPORT$LICENSE.TXT.  V0.62 is experimental and has no warranty.

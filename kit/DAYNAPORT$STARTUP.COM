@@ -2,7 +2,7 @@ $! Prepare the experimental V0.62 DaynaPORT LAN device for TCP/IP Services.
 $! Copyright (c) 2026 chatgpt5.6-sol and mlevitin.
 $! SPDX-License-Identifier: MIT
 $! Preferred boot order:
-$!   @SYS$MANAGER:DAYNAPORT_STARTUP.COM
+$!   @SYS$STARTUP:DAYNAPORT$STARTUP.COM
 $!   @SYS$STARTUP:TCPIP$STARTUP.COM
 $!
 $! Keep this procedure beside DP_MAC_INIT.EXE and DP_VCI_CONTROL.EXE.
