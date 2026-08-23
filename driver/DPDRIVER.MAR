@@ -1,0 +1,4526 @@
+        .TITLE  DPDRIVER - DaynaPORT SCSI transport for OpenVMS VAX
+        .IDENT  /V0.61/
+;
+; Copyright (c) 2026 chatgpt5.6-sol and mlevitin.
+; Licensed under the MIT License.  See LICENSE in the project root.
+;
+; Early bring-up SCSI class driver for the DaynaPORT SCSI/Link protocol.
+; V0.61 keeps the SETMODE/SENSEMODE port lifecycle and serialized cloned-port
+; requests from V0.11, adds process-context buffered receive completion, and
+; preserves the executive's R6--R11 across both direct and forked STARTIO.
+; When assembled with DP$TCPIP_ALIAS defined, the same implementation exposes
+; an XQA0:/QE0 compatibility name for TCP/IP Services while still addressing
+; DaynaPORT target 4, LUN 0.  It does not emulate DELQA hardware.
+; DP$VCI_FRONTEND adds a privileged, reversible public-VCI discovery frontend.
+; An exact private SETMODE|CTRL request can install or remove three wrappers
+; only while the LAN callback table and all driver queues match a closed-state
+; contract.  Its exact XQA create/delete paths reach the clone lifecycle only
+; after an ordinary STARTIO request has cached the hardware address.  The clone
+; carries typed asynchronous VCRP
+; ownership, SCSI-backed port management, bounded VCI transmit coalescing, and a
+; timer-paced persistent receive path whose TQE runs only while a port is active.
+; When transmit and receive work are both pending, the controller alternates
+; them so sustained TCP traffic cannot starve inbound acknowledgements.  Each
+; nonempty receive also requests one immediate follow-up READ, draining bursts
+; to empty without increasing the idle 10-ms poll rate.
+; The rejected post-WRITE holdoff experiment is removed.  Passive ICMP echo
+; request/reply telemetry now distinguishes an upper transmit, successful SCSI
+; completion, lower receive, and VCI delivery without changing packet handling.
+; The first DaynaPORT command remains deferred until STARTIO.  OpenVMS VAX
+; V7.3 does not provide a resumable SPI command context to a class driver's
+; UNIT_INIT routine.  It also reconstructs the shared-controller register from
+; the UCB after SPI resumption; the port contract restores R3, but not R6.  The
+; template UCB is now marked UCB$M_TEMPLATE so SYS$ASSIGN can create protocol
+; ports through DP_CLONED_UCB.  It deliberately remains DC$_MISC without the
+; LAN-common DPT flags: this is a self-contained public-QIO implementation,
+; not a client of the private CSMACD common layer.
+;
+; Device numbering follows the OpenVMS SCSI class-driver convention:
+;
+;       DPA<n0m>:       n = target ID, m = LUN
+;
+; Thus DPA400: connects to target 4, LUN 0 on PKA0.
+;
+; QIO interface:
+;
+;       IO$_AVAILABLE   enable the DaynaPORT interface
+;       IO$_DEACCESS    disable the DaynaPORT interface
+;       IO$_SETMODE     configure/start/stop an Ethernet protocol port
+;       IO$_SENSEMODE   return LAN port characteristics and attributes
+;       IO$_READPBLK    receive one Ethernet-format LAN payload
+;       IO$_READLBLK    same as IO$_READPBLK
+;       IO$_READVBLK    same as IO$_READPBLK
+;       IO$_WRITEPBLK   transmit one Ethernet frame
+;       IO$_WRITELBLK   same as IO$_WRITEPBLK
+;       IO$_WRITEVBLK   same as IO$_WRITEPBLK
+;
+; This source uses the documented OpenVMS SCSI Port Interface macros and the
+; standard driver macros supplied by SYS$LIBRARY:LIB.MLB on OpenVMS VAX V7.3.
+; It must not be loaded on a production system before assembly/link review and
+; static inspection of the generated map file.
+;
+
+        $CRBDEF
+        $DDBDEF
+        $DEVDEF
+        $DYNDEF
+        $FKBDEF
+        $IODEF
+        $IPLDEF
+        $IRPDEF
+        $NMADEF
+        $PCBDEF
+        $PRVDEF
+        $SCDRPDEF
+        $SSDEF
+        $UCBDEF
+        $VECDEF
+
+.IF DEFINED DP$VCI_FRONTEND
+        $DCBEDEF
+        $VCIBDEF
+        $VCRPDEF
+        .LIBRARY /SYS$LIBRARY:LANUDEF.MLB/
+        $LANUDEF
+        $LDCDEF
+        $LILDEF
+        $TQEDEF
+        $VCIBDLLDEF
+        $VCRPLANDEF
+.ENDC
+
+P1                      = 0
+P2                      = 4
+P5                      = 16
+
+DP_CDB_LENGTH           = 6
+DP_COMMAND_OVERHEAD     = 8
+DP_COMMAND_BUFFER_SIZE  = DP_CDB_LENGTH + DP_COMMAND_OVERHEAD
+DP_RX_MAX               = 1524
+DP_RX_ENVELOPE          = 6
+DP_RX_FCS               = 4
+DP_ETH_HEADER           = 14
+; EtherType bytes 08-06 appear as 0608 in a native VAX word load.
+DP_ETH_PTY_ARP          = ^X0608
+; EtherType bytes 08-00 appear as 0008 in a native VAX word load.
+DP_ETH_PTY_IP           = ^X0008
+DP_IP_VERSION           = 4
+DP_IP_MIN_IHL           = 5
+DP_IP_PROTOCOL_ICMP     = 1
+DP_ICMP_ECHO_REPLY      = 0
+DP_ICMP_ECHO_REQUEST    = 8
+DP_ICMP_HEADER          = 8
+DP_RX_WIRE_MIN          = 64
+DP_RX_WIRE_MAX          = DP_RX_MAX-DP_RX_ENVELOPE
+DP_RX_RAW_OFFSET        = 16
+DP_RX_BUFFER_LENGTH     = DP_RX_RAW_OFFSET+DP_RX_MAX
+DP_TX_MIN               = 60
+DP_TX_MAX               = 1514
+DP_MAC_REPLY_LENGTH     = 18
+DP_NMA_SET_MAX          = 512
+DP_VCI_P2_SNAPSHOT_MAX = 72
+DP_NMA_SCALAR_LENGTH    = 6
+DP_NMA_ADDRESS_LENGTH   = 6
+DP_NMA_STRING_OVERHEAD  = 4
+DP_NMA_ADDRESS_ENTRY    = DP_NMA_STRING_OVERHEAD + DP_NMA_ADDRESS_LENGTH
+DP_NMA_M_STRING         = ^X1000        ; PRM_TYP_M_STRING in LANIMAC
+DP_POOL_HEADER_LENGTH   = 16            ; DYN header plus alignment padding
+DP_DYN_W_SIZE           = 8             ; VAX V7.3 common DYN header
+DP_DYN_B_TYPE           = 10
+DP_BUFIO_L_DATA         = 0
+DP_BUFIO_L_BUFFER       = 4
+DP_BUFIO_W_SIZE         = 8
+DP_BUFIO_B_TYPE         = 10
+DP_BUFIO_B_FLAGS        = 11
+DP_RHDR_L_DATA          = 0
+DP_RHDR_L_BUFFER        = 4
+DP_RHDR_W_SIZE          = 8
+DP_RHDR_B_TYPE          = 10
+DP_RHDR_B_FLAGS         = 11
+DP_RHDR_T_DATA          = 12
+DP_RHDR_C_DATA          = 14
+DP_RHDR_C_LENGTH        = DP_RHDR_T_DATA+DP_RHDR_C_DATA
+DP_STACK_LONGWORDS      = 12
+DP_SCDRPS_PER_UNIT      = 1
+DP_SCSI_STATUS_MASK     = ^XC1
+DP_CONTROLLER_MAGIC     = ^X44504342    ; "DPCB"
+DP_CONTROLLER_V_READY   = 0
+DP_CONTROLLER_M_READY   = 1@DP_CONTROLLER_V_READY
+DP_CONTROLLER_V_BUSY    = 1
+DP_CONTROLLER_M_BUSY    = 1@DP_CONTROLLER_V_BUSY
+DP_CONTROLLER_V_MAC_VALID = 2
+DP_CONTROLLER_M_MAC_VALID = 1@DP_CONTROLLER_V_MAC_VALID
+DP_CONTROLLER_V_ENABLED = 3
+DP_CONTROLLER_M_ENABLED = 1@DP_CONTROLLER_V_ENABLED
+DP_CONTROLLER_V_FORK_ACTIVE = 4
+DP_CONTROLLER_M_FORK_ACTIVE = 1@DP_CONTROLLER_V_FORK_ACTIVE
+DP_CONTROLLER_V_START_ACTIVE = 5
+DP_CONTROLLER_M_START_ACTIVE = 1@DP_CONTROLLER_V_START_ACTIVE
+.IF DEFINED DP$VCI_FRONTEND
+DP_CTL_V_VCI_POLL       = 6
+DP_CTL_M_VCI_POLL       = 1@DP_CTL_V_VCI_POLL
+DP_CTL_V_VCI_TIMER      = 7
+DP_CTL_M_VCI_TIMER      = 1@DP_CTL_V_VCI_TIMER
+DP_CTL_V_VCI_HOOKED     = 8
+DP_CTL_M_VCI_HOOKED     = 1@DP_CTL_V_VCI_HOOKED
+DP_CTL_V_VCI_LAST_RCV   = 9
+DP_CTL_M_VCI_LAST_RCV   = 1@DP_CTL_V_VCI_LAST_RCV
+.ENDC
+DP_PORT_V_TEMPLATE      = 0
+DP_PORT_M_TEMPLATE      = 1@DP_PORT_V_TEMPLATE
+DP_PORT_V_STARTED       = 1
+DP_PORT_M_STARTED       = 1@DP_PORT_V_STARTED
+DP_PORT_V_STARTING      = 2
+DP_PORT_M_STARTING      = 1@DP_PORT_V_STARTING
+DP_PORT_V_STOPPING      = 3
+DP_PORT_M_STOPPING      = 1@DP_PORT_V_STOPPING
+DP_PORT_DEFAULT_BUS     = 1500
+DP_PORT_DEFAULT_BFN     = 1
+DP_PORT_DEFAULT_PAD     = NMA$C_STATE_ON
+DP_PORT_MAX_BUS         = 9234
+DP_PORT_MAX_BFN         = 255
+
+.IF DEFINED DP$VCI_FRONTEND
+DP_VCI_DDT_CLONEDUCB    = ^X24          ; confirmed from resident VAX DDT
+DP_VCI_RCV_DEFAULT      = 32            ; USER4 zero/invalid fallback
+DP_VCI_RCV_MIN          = 8             ; guarded site-tunable range
+DP_VCI_RCV_MAX          = 128
+DP_VCI_POLL_DELTA       = 100000        ; 10 ms in 100 ns units
+DP_VCI_CTL_INSTALL      = ^X5643492B    ; "VCI+"
+DP_VCI_CTL_REMOVE       = ^X5643492D    ; "VCI-"
+DP_VCI_CREATE_S_ENTER   = 1
+DP_VCI_CREATE_S_SIZE    = 2
+DP_VCI_CREATE_S_POOL    = 3
+DP_VCI_CREATE_S_CLONE   = 4
+DP_VCI_CREATE_S_DDT     = 5
+DP_VCI_CREATE_S_DONE    = 6
+DP_VCI_V_FRAME          = 31
+DP_VCI_M_FRAME          = 1@DP_VCI_V_FRAME ; private queued TRANSMIT_FRAME tag
+DP_VCI_CHAIN_NONE       = 0
+DP_VCI_CHAIN_SVA        = 1
+DP_VCI_CHAIN_SVAPTE     = 2
+DP_VCI_CHAIN_MULTIPLE   = 3
+.ENDC
+
+DP_ATTR_V_ACC           = 0
+DP_ATTR_M_ACC           = 1@DP_ATTR_V_ACC
+DP_ATTR_V_BFN           = 1
+DP_ATTR_M_BFN           = 1@DP_ATTR_V_BFN
+DP_ATTR_V_BUS           = 2
+DP_ATTR_M_BUS           = 1@DP_ATTR_V_BUS
+DP_ATTR_V_FMT           = 3
+DP_ATTR_M_FMT           = 1@DP_ATTR_V_FMT
+DP_ATTR_V_PAD           = 4
+DP_ATTR_M_PAD           = 1@DP_ATTR_V_PAD
+DP_ATTR_V_PTY           = 5
+DP_ATTR_M_PTY           = 1@DP_ATTR_V_PTY
+DP_ATTR_V_PRM           = 6
+DP_ATTR_M_PRM           = 1@DP_ATTR_V_PRM
+DP_ATTR_V_MLT           = 7
+DP_ATTR_M_MLT           = 1@DP_ATTR_V_MLT
+DP_ATTR_V_CRC           = 8
+DP_ATTR_M_CRC           = 1@DP_ATTR_V_CRC
+DP_ATTR_V_MCA           = 9
+DP_ATTR_M_MCA           = 1@DP_ATTR_V_MCA
+DP_ATTR_V_RES           = 10
+DP_ATTR_M_RES           = 1@DP_ATTR_V_RES
+
+DP_OP_READ              = ^X08
+DP_OP_READ_MAC          = ^X09
+DP_OP_WRITE             = ^X0A
+DP_OP_INTERFACE         = ^X0E
+DP_READ_SINGLE          = ^X80
+DP_INTERFACE_ENABLE     = ^X80
+
+; Bring-up breadcrumbs exposed through UCB$L_DEVDEPEND/DEVDEPND2.  They let
+; SDA distinguish dispatch, buffer mapping, and command submission failures
+; without logging from interrupt context.
+
+DP_STAGE_HANDLER        = 1
+DP_STAGE_MAPPED         = 2
+DP_STAGE_SENT           = 3
+
+        .IIF NDF DT$_GENERIC_SCSI, DT$_GENERIC_SCSI = 5
+        .IIF NDF DPT$M_NO_IDB_DISPATCH, DPT$M_NO_IDB_DISPATCH = ^X1000
+        .IIF NDF DPT$M_CSMACD, DPT$M_CSMACD = ^X8000
+; The installed VAX V7.3 $DYNDEF omits the SCSI-private pool type.  The V7.3
+; SCSI ABI uses decimal 93 for the SCDRP dynamic type.
+        .IIF NDF DYN$C_SCDRP, DYN$C_SCDRP = 93
+; VAX V7.3 $DYNDEF does not export generic DYN$W_SIZE/DYN$B_TYPE field
+; symbols.  The local offsets above were validated against the target
+; allocator behavior and are covered by structural source checks.
+; VAX V7.3 uses the original SCDRP flag names; newer headers renamed them.
+        .IIF NDF SCDRP$M_S0BUF, SCDRP$M_S0BUF = SCDRP$M_FLAG_S0BUF
+        .IIF NDF SCDRP$V_S0BUF, SCDRP$V_S0BUF = SCDRP$V_FLAG_S0BUF
+
+; Private IRP overlays used only while a SENSEMODE FDT routine owns the IRP.
+IRP_L_DP_SENSE_P1       = IRP$L_IOST2
+IRP_L_DP_SENSE_P2       = IRP$Q_STATION
+IRP_W_DP_SENSE_P2SIZE   = IRP$Q_STATION+4
+IRP_L_DP_VCI_CONTROL    = IRP$L_MEDIA
+
+; ----- Shared controller and per-port UCB extensions --------------------
+;
+; There is exactly one DPCB per physical DaynaPORT target.  It owns the SPI
+; connection, the serialized SCDRP, and the coroutine stack.  A template UCB
+; and all future cloned protocol-port UCBs point to the same DPCB.  Clones
+; must never call SPI$CONNECT or interpret their unit numbers as SCSI IDs.
+;
+; The two public NI pointer slots remain untouched at their VAX V7.3 offsets
+; below UCB$K_LCL_DISK_LENGTH.  Private state continues after the larger SCSI
+; class UCB base, not after the shorter NI extension.
+
+        ASSUME  UCB$L_NI_HWAPTR LT UCB$K_LCL_DISK_LENGTH
+        ASSUME  UCB$L_NI_MLTPTR LT UCB$K_LCL_DISK_LENGTH
+
+        $DEFINI DPCB
+
+$DEF    DPCB_L_MAGIC            .BLKL   1
+$DEF    DPCB_L_TEMPLATE_UCB     .BLKL   1
+$DEF    DPCB_L_STACK_PTR        .BLKL   1
+$DEF    DPCB_L_STACK            .BLKL   DP_STACK_LONGWORDS
+$DEF    DPCB_L_SCDRP            .BLKL   1
+$DEF    DPCB_L_SCDT             .BLKL   1
+$DEF    DPCB_L_PDT              .BLKL   1
+$DEF    DPCB_L_SCDRPQ_FL        .BLKL   1
+$DEF    DPCB_L_SCDRPQ_BL        .BLKL   1
+$DEF    DPCB_L_WAITQ_FL         .BLKL   1
+$DEF    DPCB_L_WAITQ_BL         .BLKL   1
+$DEF    DPCB_B_WAIT_FKB         .BLKB   FKB$C_LENGTH
+$DEF    DPCB_L_FLAGS            .BLKL   1
+$DEF    DPCB_L_ACTIVE_PORTS     .BLKL   1
+$DEF    DPCB_B_MAC_REPLY        .BLKB   DP_MAC_REPLY_LENGTH
+$DEF    DPCB_B_TARGET           .BLKB   1
+$DEF    DPCB_B_LUN              .BLKB   1
+$DEF    DPCB_W_RESERVED         .BLKW   1
+$DEF    DPCB_L_FORK_R6          .BLKL   1
+$DEF    DPCB_L_FORK_R7          .BLKL   1
+$DEF    DPCB_L_FORK_R8          .BLKL   1
+$DEF    DPCB_L_FORK_R9          .BLKL   1
+$DEF    DPCB_L_FORK_R10         .BLKL   1
+$DEF    DPCB_L_FORK_R11         .BLKL   1
+$DEF    DPCB_L_START_R6         .BLKL   1
+$DEF    DPCB_L_START_R7         .BLKL   1
+$DEF    DPCB_L_START_R8         .BLKL   1
+$DEF    DPCB_L_START_R9         .BLKL   1
+$DEF    DPCB_L_START_R10        .BLKL   1
+$DEF    DPCB_L_START_R11        .BLKL   1
+$DEF    DPCB_L_SPI_R7           .BLKL   1
+$DEF    DPCB_L_SPI_R8           .BLKL   1
+$DEF    DPCB_L_SPI_R9           .BLKL   1
+$DEF    DPCB_L_SPI_R10          .BLKL   1
+$DEF    DPCB_L_SPI_R11          .BLKL   1
+.IF DEFINED DP$VCI_FRONTEND
+$DEF    DPCB_L_VCIQ_FL          .BLKL   1
+$DEF    DPCB_L_VCIQ_BL          .BLKL   1
+$DEF    DPCB_L_VCI_ACTIVE_VCRP  .BLKL   1
+$DEF    DPCB_L_VCI_ACTIVE_VCIB  .BLKL   1
+$DEF    DPCB_L_VCI_EVENT        .BLKL   1
+$DEF    DPCB_L_VCI_TX_LENGTH    .BLKL   1
+$DEF    DPCB_B_VCI_TX_BUFFER    .BLKB   DP_TX_MAX
+$DEF    DPCB_L_VCI_PORTS        .BLKL   1
+$DEF    DPCB_L_VCI_ACTIVE_PORTS .BLKL   1
+$DEF    DPCB_L_VCI_RCVQ_FL      .BLKL   1
+$DEF    DPCB_L_VCI_RCVQ_BL      .BLKL   1
+$DEF    DPCB_L_VCI_RCV_COUNT    .BLKL   1
+$DEF    DPCB_L_VCI_ACTIVE_RCV   .BLKL   1
+$DEF    DPCB_L_VCI_CREATE_SIZE  .BLKL   1
+$DEF    DPCB_L_VCI_CREATE_STAGE .BLKL   1
+$DEF    DPCB_L_VCI_MGMT_FUNCTION .BLKL  1
+$DEF    DPCB_L_VCI_MGMT_P2_SIZE .BLKL   1
+$DEF    DPCB_L_VCI_MGMT_STATUS  .BLKL   1
+$DEF    DPCB_L_VCI_MGMT_STATUS2 .BLKL   1
+$DEF    DPCB_L_VCI_FIRST_FUNCTION .BLKL 1
+$DEF    DPCB_L_VCI_FIRST_STATUS .BLKL   1
+$DEF    DPCB_L_VCI_FIRST_STATUS2 .BLKL  1
+$DEF    DPCB_L_VCI_WORK_FUNCTION .BLKL  1
+$DEF    DPCB_L_VCI_WORK_STATUS  .BLKL   1
+$DEF    DPCB_L_VCI_WORK_STATUS2 .BLKL   1
+$DEF    DPCB_L_VCI_CHAIN_SEEN   .BLKL   1
+$DEF    DPCB_L_VCI_CHAIN_MODE   .BLKL   1
+$DEF    DPCB_L_VCI_CHAIN_BCNT   .BLKL   1
+$DEF    DPCB_L_VCI_CHAIN_STATUS .BLKL   1
+$DEF    DPCB_L_VCI_TX_ENTRY_COUNT .BLKL 1
+$DEF    DPCB_L_VCI_TX_QUEUE_COUNT .BLKL 1
+$DEF    DPCB_L_VCI_TX_COMPLETE_COUNT .BLKL 1
+$DEF    DPCB_L_VCI_TX_STATUS    .BLKL   1
+$DEF    DPCB_L_VCI_TX_STATUS2   .BLKL   1
+$DEF    DPCB_L_VCI_TX_LAST_BCNT .BLKL   1
+$DEF    DPCB_L_VCI_TX_LAST_TOTAL .BLKL  1
+$DEF    DPCB_L_VCI_TX_ICMP_SEEN  .BLKL   1
+$DEF    DPCB_L_VCI_TX_ICMP_COMPLETE .BLKL 1
+$DEF    DPCB_L_VCI_TX_ICMP_IDSEQ .BLKL   1
+$DEF    DPCB_L_VCI_RCV_DELIVER_COUNT .BLKL 1
+$DEF    DPCB_L_VCI_RCV_RETURN_COUNT .BLKL 1
+$DEF    DPCB_L_VCI_RCV_NO_BUFFER_COUNT .BLKL 1
+$DEF    DPCB_L_VCI_RCV_MAX_OUTSTANDING .BLKL 1
+$DEF    DPCB_L_VCI_RCV_LAST_VCRP .BLKL 1
+$DEF    DPCB_L_VCI_RCV_LAST_VCIB .BLKL 1
+$DEF    DPCB_L_VCI_RCV_LAST_BOFF .BLKL 1
+$DEF    DPCB_L_VCI_RCV_LAST_BCNT .BLKL 1
+$DEF    DPCB_L_VCI_RCV_LAST_BUFFER .BLKL 1
+$DEF    DPCB_L_VCI_RCV_LAST_HEADER .BLKL 1
+$DEF    DPCB_L_VCI_RCV_LAST_WIRE .BLKL 1
+$DEF    DPCB_L_VCI_RCV_LAST_TRANSFER .BLKL 1
+$DEF    DPCB_L_VCI_RCV_ARP_SEEN  .BLKL   1
+$DEF    DPCB_L_VCI_RCV_ARP_DELIVER .BLKL 1
+$DEF    DPCB_L_VCI_RCV_ARP_WIRE  .BLKL   1
+$DEF    DPCB_L_VCI_RCV_ARP_TRANSFER .BLKL 1
+$DEF    DPCB_L_VCI_RCV_ARP_VCRP  .BLKL   1
+$DEF    DPCB_L_VCI_RCV_ARP_VCIB  .BLKL   1
+$DEF    DPCB_L_VCI_RCV_ARP_UCB   .BLKL   1
+$DEF    DPCB_L_VCI_RCV_ARP_RAW0  .BLKL   1
+$DEF    DPCB_L_VCI_RCV_ARP_RAW1  .BLKL   1
+$DEF    DPCB_L_VCI_RCV_ARP_RAW2  .BLKL   1
+$DEF    DPCB_L_VCI_RCV_ARP_RAW3  .BLKL   1
+$DEF    DPCB_L_VCI_RCV_ARP_RAW4  .BLKL   1
+$DEF    DPCB_L_VCI_RCV_ARP_RAW5  .BLKL   1
+$DEF    DPCB_L_VCI_RCV_ARP_RAW6  .BLKL   1
+$DEF    DPCB_L_VCI_RCV_ARP_RAW7  .BLKL   1
+$DEF    DPCB_L_VCI_RCV_ICMP_SEEN .BLKL   1
+$DEF    DPCB_L_VCI_RCV_ICMP_DELIVER .BLKL 1
+$DEF    DPCB_L_VCI_RCV_ICMP_IDSEQ .BLKL  1
+$DEF    DPCB_L_VCI_RCV_ICMP_WIRE .BLKL   1
+$DEF    DPCB_L_VCI_RCV_ICMP_TRANSFER .BLKL 1
+$DEF    DPCB_B_VCI_TQE          .BLKB   TQE$C_LENGTH
+.ENDC
+$DEF    DPCB_L_SET_FUNCTION     .BLKL   1
+$DEF    DPCB_L_SET_P2_SIZE      .BLKL   1
+$DEF    DPCB_L_SET_BAD_ID       .BLKL   1
+$DEF    DPCB_L_SET_REMAINING    .BLKL   1
+$DEF    DPCB_L_SET_BAD_RAW0     .BLKL   1
+$DEF    DPCB_L_SET_BAD_RAW1     .BLKL   1
+$DEF    DPCB_L_SET_STATUS       .BLKL   1
+$DEF    DPCB_K_LENGTH
+
+        $DEFEND DPCB
+
+        $DEFINI UCB
+        .=UCB$K_LCL_DISK_LENGTH
+
+$DEF    UCB_L_DP_CONTROLLER     .BLKL   1
+$DEF    UCB_L_DP_SCDRP          .BLKL   1
+$DEF    UCB_L_DP_PORT_FLAGS     .BLKL   1
+$DEF    UCB_W_DP_PORT_PTY       .BLKW   1
+$DEF    UCB_W_DP_PORT_BUS       .BLKW   1
+$DEF    UCB_B_DP_PORT_PAD       .BLKB   1
+$DEF    UCB_B_DP_PORT_BFN       .BLKB   1
+$DEF    UCB_B_DP_PORT_ACC       .BLKB   1
+$DEF    UCB_B_DP_PORT_RES       .BLKB   1
+.IF DEFINED DP$VCI_FRONTEND
+$DEF    UCB_L_DP_VCIB           .BLKL   1
+$DEF    UCB_L_DP_VCI_NEXT       .BLKL   1
+$DEF    UCB_Q_DP_HWA            .BLKQ   1
+$DEF    UCB_Q_DP_PHA            .BLKQ   1
+.ENDC
+$DEF    UCB_K_DP_UCBLEN
+
+        $DEFEND UCB
+
+; ----- Small coroutine stack --------------------------------------------
+;
+; SPI calls are permitted to suspend the driver thread.  The continuation
+; address therefore lives in the shared controller stack, not on the kernel
+; stack.  Only the request that owns the controller's sole SCDRP may reset or
+; use this stack.
+;
+
+        .MACRO  DP_INIT_STACK,CB=R6
+        MOVAL   DPCB_L_STACK-4(CB),DPCB_L_STACK_PTR(CB)
+        .ENDM   DP_INIT_STACK
+
+        .MACRO  DP_SUBPUSH,ARG,CB=R6
+        ADDL    #4,DPCB_L_STACK_PTR(CB)
+        MOVL    ARG,@DPCB_L_STACK_PTR(CB)
+        .ENDM   DP_SUBPUSH
+
+        .MACRO  DP_SUBPOP,ARG,CB=R6
+        MOVL    @DPCB_L_STACK_PTR(CB),ARG
+        SUBL    #4,DPCB_L_STACK_PTR(CB)
+        .ENDM   DP_SUBPOP
+
+        .MACRO  DP_SUBSAVE,CB=R6
+        DP_SUBPUSH (SP)+,CB
+        .ENDM   DP_SUBSAVE
+
+        .MACRO  DP_SUBRETURN,CB=R6
+; PKBDRIVER restores R3 from SCDRP$L_UCB before jumping to the class
+; continuation saved by SPI$SEND_COMMAND.  It does not preserve R6 across the
+; asynchronous command.  Reacquire the DPCB before using its coroutine stack.
+        MOVL    UCB_L_DP_CONTROLLER(R3),CB
+        DP_SUBPOP -(SP),CB
+        RSB
+        .ENDM   DP_SUBRETURN
+
+        .MACRO  DP_SENSE_SCALAR,IDENT,VALUE,?FITS
+        CMPL    R10,#DP_NMA_SCALAR_LENGTH
+        BGEQU   FITS
+        BRW     DP_SENSE_OVERFLOW
+FITS:   MOVW    #IDENT,(R9)+
+        MOVL    VALUE,(R9)+
+        SUBL    #DP_NMA_SCALAR_LENGTH,R10
+        ADDL    #DP_NMA_SCALAR_LENGTH,R11
+        .ENDM   DP_SENSE_SCALAR
+
+        .MACRO  DP_INIT_PORT,UCB,FLAGS=0
+        CLRL    UCB_L_DP_SCDRP(UCB)
+        MOVL    #FLAGS,UCB_L_DP_PORT_FLAGS(UCB)
+        CLRW    UCB_W_DP_PORT_PTY(UCB)
+        MOVW    #DP_PORT_DEFAULT_BUS,UCB_W_DP_PORT_BUS(UCB)
+        MOVW    #DP_PORT_DEFAULT_BUS,UCB$W_DEVBUFSIZ(UCB)
+        MOVB    #DP_PORT_DEFAULT_PAD,UCB_B_DP_PORT_PAD(UCB)
+        MOVB    #DP_PORT_DEFAULT_BFN,UCB_B_DP_PORT_BFN(UCB)
+        MOVB    #NMA$C_ACC_EXC,UCB_B_DP_PORT_ACC(UCB)
+        MOVB    #NMA$C_LINRES_DIS,UCB_B_DP_PORT_RES(UCB)
+.IF DEFINED DP$VCI_FRONTEND
+        CLRL    UCB_L_DP_VCIB(UCB)
+        CLRL    UCB_L_DP_VCI_NEXT(UCB)
+        CLRQ    UCB_Q_DP_HWA(UCB)
+        CLRQ    UCB_Q_DP_PHA(UCB)
+.ENDC
+        .ENDM   DP_INIT_PORT
+
+; ----- Driver tables -----------------------------------------------------
+
+.IF DEFINED DP$TCPIP_ALIAS
+        DPTAB   END=DP_END,-
+                ADAPTER=NULL,-
+                UCBSIZE=<UCB_K_DP_UCBLEN>,-
+                NAME=DYDRIVER,-
+                FLAGS=<DPT$M_SMPMOD!DPT$M_NO_IDB_DISPATCH!DPT$M_CSMACD>
+.IFF
+        DPTAB   END=DP_END,-
+                ADAPTER=NULL,-
+                UCBSIZE=<UCB_K_DP_UCBLEN>,-
+                NAME=DPDRIVER,-
+                FLAGS=<DPT$M_SMPMOD!DPT$M_NO_IDB_DISPATCH>
+.ENDC
+
+        DPT_STORE INIT
+        DPT_STORE UCB,UCB$L_MAXBCNT,L,DP_RX_MAX
+        DPT_STORE UCB,UCB$W_DEVBUFSIZ,W,DP_PORT_DEFAULT_BUS
+        DPT_STORE UCB,UCB$B_FLCK,B,SPL$C_IOLOCK8
+        DPT_STORE UCB,UCB$B_DIPL,B,22
+.IF DEFINED DP$TCPIP_ALIAS
+        DPT_STORE UCB,UCB$L_DEVCHAR,L,-
+                <DEV$M_AVL!DEV$M_NET!DEV$M_IDV!DEV$M_ODV>
+        DPT_STORE UCB,UCB$B_DEVTYPE,B,DT$_XQ_DELQA
+        DPT_STORE UCB,UCB$B_DEVCLASS,B,DC$_SCOM
+.IFF
+        DPT_STORE UCB,UCB$L_DEVCHAR,L,-
+                <DEV$M_AVL!DEV$M_IDV!DEV$M_ODV!DEV$M_SHR!DEV$M_RND>
+        DPT_STORE UCB,UCB$L_DEVCHAR2,L,<DEV$M_NNM>
+        DPT_STORE UCB,UCB$B_DEVTYPE,B,DT$_GENERIC_SCSI
+        DPT_STORE UCB,UCB$B_DEVCLASS,B,DC$_MISC
+.ENDC
+        DPT_STORE UCB,UCB$L_STS,L,UCB$M_TEMPLATE
+        DPT_STORE UCB,UCB$W_DEVSTS,W,UCB$M_NOCNVRT
+
+        DPT_STORE REINIT
+.IF DEFINED DP$TCPIP_ALIAS
+        DPT_STORE DDB,DDB$L_DDT,D,XQ$DDT
+.IFF
+        DPT_STORE DDB,DDB$L_DDT,D,DP$DDT
+.ENDC
+        DPT_STORE CRB,CRB$L_INTD+VEC$L_INITIAL,D,DP_CTRL_INIT
+        DPT_STORE CRB,CRB$L_INTD+VEC$L_UNITINIT,D,DP_UNIT_INIT
+        DPT_STORE CRB,CRB$B_FLCK,B,IPL$_IOLOCK8
+        DPT_STORE END
+
+.IF DEFINED DP$TCPIP_ALIAS
+        DDTAB   DEVNAM=XQ,-
+                START=DP_STARTIO,-
+                FUNCTB=DP_FUNCTABLE,-
+                CLONEDUCB=DP_CLONED_UCB
+.IFF
+        DDTAB   DEVNAM=DP,-
+                START=DP_STARTIO,-
+                FUNCTB=DP_FUNCTABLE,-
+                CLONEDUCB=DP_CLONED_UCB
+.ENDC
+
+DP_FUNCTABLE:
+        FUNCTAB ,-
+                <AVAILABLE,DEACCESS,SETMODE,SETCHAR,SENSEMODE,SENSECHAR,-
+                 READPBLK,READLBLK,READVBLK,-
+                 WRITEPBLK,WRITELBLK,WRITEVBLK>
+        FUNCTAB ,<>
+; Receive follows the VAX LAN buffered-I/O model reconstructed from XQDRIVER:
+; EXE$READCHK validates P1, while an S0 BUFIO block carries the DaynaPORT raw
+; reply to IOC$IOPOST.  Host-to-device buffers use an explicit WRITELOCKR
+; coroutine followed by QIODRVPKT; the generic EXE$WRITE wrapper is not used.
+; IO_ROUTINES canonicalizes virtual block functions before scanning these
+; masks (READVBLK -> READLBLK and WRITEVBLK -> WRITELBLK).  All three forms
+; must therefore be present; omitting the logical form lets the FDT scan run
+; past the final record and interpret following driver data as FDT entries.
+        FUNCTAB DP_SETMODE_FDT,<SETMODE,SETCHAR>
+        FUNCTAB DP_SENSEMODE_FDT,<SENSEMODE,SENSECHAR>
+        FUNCTAB DP_READ_FDT,<READPBLK,READLBLK,READVBLK>
+        FUNCTAB DP_WRITE_FDT,-
+                <WRITEPBLK,WRITELBLK,WRITEVBLK>
+        FUNCTAB +EXE$ZEROPARM,-
+                <AVAILABLE,DEACCESS>
+
+; ----- Fixed CDB templates -----------------------------------------------
+
+DP_ENABLE_CDB:
+        .BYTE   DP_OP_INTERFACE,0,0,0,0,DP_INTERFACE_ENABLE
+DP_DISABLE_CDB:
+        .BYTE   DP_OP_INTERFACE,0,0,0,0,0
+DP_READ_MAC_CDB:
+        .BYTE   DP_OP_READ_MAC,0,0,0,0,0
+DP_READ_CDB:
+        .BYTE   DP_OP_READ,0,0,0,0,DP_READ_SINGLE
+DP_WRITE_CDB:
+        .BYTE   DP_OP_WRITE,0,0,0,0,0
+
+.IF DEFINED DP$VCI_FRONTEND
+; Public VCI state for the optional XQA compatibility frontend.  Driver
+; psects are resident and writable on this target.  The four-byte counted
+; name is also the exact value used by the resident LAN create-port routine.
+
+DP_VCI_NAME:
+        .ASCIC  /XQA/
+        .ALIGN  LONG
+DP_VCI_LDC:
+        .LONG   0                       ; runtime system VA of DP_VCI_NAME
+        .WORD   VCIB$K_DLL_CSMACD
+        .WORD   DP_VCI_RCV_DEFAULT
+        .LONG   0                       ; rate in units of 128 bits/second
+        .LONG   0                       ; rate in units of 256 bits/second
+        .BYTE   DT$_XQ_DELQA
+        .BYTE   0                       ; no MOP device ID
+        .WORD   0
+        .LONG   0                       ; no MOP device name
+        .LONG   1                       ; minimum receive VCRPs
+        .LONG   DP_VCI_RCV_DEFAULT      ; maximum receive VCRPs
+        .LONG   0                       ; current receive VCRPs
+        .LONG   DP_VCI_RCV_DEFAULT      ; desired receive VCRPs
+
+        ASSUME  .-DP_VCI_LDC EQ LDC$K_LENGTH
+
+DP_VCI_TEMPLATE_UCB:
+        .LONG   0
+DP_VCI_LAN_BLOCK:
+        .LONG   0
+DP_VCI_ORIGINAL_GET:
+        .LONG   0
+DP_VCI_ORIGINAL_CREATE:
+        .LONG   0
+DP_VCI_ORIGINAL_DELETE:
+        .LONG   0
+DP_VCI_TRANSMIT_AVAILABLE:
+        .LONG   1
+; Raw transmit-entry telemetry is deliberately global and precedes every
+; VCRP/VCIB validation.  TCP/IP Services V5.1 can therefore be distinguished
+; from a client which rejects the request before either public transmit entry.
+; The bounded header snapshot also proves whether the legacy zero-size dynamic
+; header used by PORTMGMT is present on transmit VCRPs.
+DP_VCI_TX_RAW_ENTRY_COUNT:
+        .LONG   0
+DP_VCI_TX_RAW_FRAME_COUNT:
+        .LONG   0
+DP_VCI_TX_RAW_INIT_COUNT:
+        .LONG   0
+DP_VCI_TX_RAW_VCRP:
+        .LONG   0
+DP_VCI_TX_RAW_VCIB:
+        .LONG   0
+DP_VCI_TX_RAW0:
+        .LONG   0
+DP_VCI_TX_RAW1:
+        .LONG   0
+DP_VCI_TX_RAW2:
+        .LONG   0
+DP_VCI_TX_RAW3:
+        .LONG   0
+DP_VCI_TX_RAW_SIZE:
+        .LONG   0
+DP_VCI_TX_RAW_TYPE:
+        .LONG   0
+DP_VCI_TX_RAW_FUNCTION:
+        .LONG   0
+; Entry telemetry precedes every PORTMGMT validation.  It distinguishes a
+; callback that was never invoked from a legacy VCRP rejected by an early
+; dynamic-header guard.  These cells are diagnostic only.
+DP_VCI_MGMT_ENTRY_COUNT:
+        .LONG   0
+DP_VCI_MGMT_ENTRY_VCRP:
+        .LONG   0
+DP_VCI_MGMT_ENTRY_VCIB:
+        .LONG   0
+DP_VCI_MGMT_ENTRY_RAW0:
+        .LONG   0
+DP_VCI_MGMT_ENTRY_RAW1:
+        .LONG   0
+DP_VCI_MGMT_ENTRY_RAW2:
+        .LONG   0
+DP_VCI_MGMT_ENTRY_RAW3:
+        .LONG   0
+DP_VCI_MGMT_ENTRY_SIZE:
+        .LONG   0
+DP_VCI_MGMT_ENTRY_TYPE:
+        .LONG   0
+DP_VCI_MGMT_ENTRY_FUNCTION:
+        .LONG   0
+DP_VCI_MGMT_P2_SNAPSHOT_SIZE:
+        .LONG   0
+DP_VCI_MGMT_P2_SNAPSHOT:
+        .BLKB   DP_VCI_P2_SNAPSHOT_MAX
+.ENDC
+
+; ----- Initialization ----------------------------------------------------
+
+DP_CTRL_INIT:
+        MOVZWL  #SS$_NORMAL,R0
+        RSB
+
+DP_UNIT_INIT:
+        BBC     #UCB$V_POWER,UCB$W_STS(R5),10$
+        RSB
+
+10$:    FORK
+        FORK
+
+; EXE$FORKDSPTH owns R6 as the current software-interrupt fork-queue head and
+; uses it again after this callback returns.  Most connects happened to run as
+; the final IPL-8 fork and hid this contract violation; a contended boot made
+; the following controller allocation overwrite R6 with the DPCB and crashed
+; the dispatcher's next REMQUE.  Preserve the executive value across the
+; actual deferred UNIT_INIT body.
+
+        PUSHL   R6
+
+; Allocate the permanent controller block before any transport resources.
+; DP_ALLOC_POOL returns zeroed nonpaged storage and preserves R5.
+
+        MOVL    #DPCB_K_LENGTH,R1
+        MOVL    R5,R3
+        BSBW    DP_ALLOC_POOL
+        BLBS    R0,11$
+        BRW     90$
+11$:
+        MOVL    R2,R6
+        MOVL    #DP_CONTROLLER_MAGIC,DPCB_L_MAGIC(R6)
+        MOVL    R5,DPCB_L_TEMPLATE_UCB(R6)
+        MOVL    R6,UCB_L_DP_CONTROLLER(R5)
+        DP_INIT_PORT UCB=R5,FLAGS=DP_PORT_M_TEMPLATE
+        DP_INIT_STACK
+
+; The SCDRP free list and the controller-owner wait queue are distinct.  All
+; cloned UCBs use IOLOCK8, and the embedded fork block resumes exactly one
+; queued owner while the controller busy bit remains set.
+
+        MOVAL   DPCB_L_SCDRPQ_FL(R6),R0
+        MOVL    R0,(R0)
+        MOVL    R0,4(R0)
+        MOVAL   DPCB_L_WAITQ_FL(R6),R0
+        MOVL    R0,(R0)
+        MOVL    R0,4(R0)
+.IF DEFINED DP$VCI_FRONTEND
+        MOVAL   DPCB_L_VCIQ_FL(R6),R0
+        MOVL    R0,(R0)
+        MOVL    R0,4(R0)
+        MOVAL   DPCB_L_VCI_RCVQ_FL(R6),R0
+        MOVL    R0,(R0)
+        MOVL    R0,4(R0)
+.ENDC
+        MOVW    #FKB$C_LENGTH,DPCB_B_WAIT_FKB+FKB$W_SIZE(R6)
+        MOVB    #DYN$C_FRK,DPCB_B_WAIT_FKB+FKB$B_TYPE(R6)
+        MOVB    #SPL$C_IOLOCK8,DPCB_B_WAIT_FKB+FKB$B_FLCK(R6)
+
+; Allocate the one SCDRP needed by the serialized STARTIO path.
+
+        MOVL    #SCDRP$C_LENGTH,R1
+        MOVL    R5,R3
+        BSBW    DP_ALLOC_POOL
+        BLBS    R0,12$
+        BRW     90$
+12$:
+        MOVW    #SCDRP$C_LENGTH,SCDRP$W_SCDRPSIZE(R2)
+        MOVB    #DYN$C_SCDRP,SCDRP$B_CD_TYPE(R2)
+        INSQUE  SCDRP$L_FQFL(R2),DPCB_L_SCDRPQ_FL(R6)
+
+; A normal DP unit n0m means target n, LUN m.  The TCP/IP compatibility image
+; must use XQA0 so TCP/IP names it QE0; that build therefore fixes the actual
+; SCSI address at the current DaynaPORT target 4, LUN 0.
+
+.IF DEFINED DP$TCPIP_ALIAS
+        MOVL    #4,R1
+        CLRL    R2
+.IFF
+        MOVZWL  UCB$W_UNIT(R5),R1
+        CLRL    R2
+        EDIV    #100,R1,R1,R2
+        CMPL    R1,#7
+        BLEQU   13$
+        BRW     90$
+13$:
+        CMPL    R2,#7
+        BLEQU   14$
+        BRW     90$
+14$:
+.ENDC
+        MOVB    R1,DPCB_B_TARGET(R6)
+        MOVB    R2,DPCB_B_LUN(R6)
+        ASHL    #16,R1,R1
+        ASHL    #16,R2,R2
+        MOVL    UCB$L_DDB(R5),R0
+        SUBB3   #^A'A',DDB$T_NAME+3(R0),R1
+        SPI$CONNECT
+        BLBS    R0,15$
+        BRW     90$
+15$:
+        CMPL    R1,UCB$L_MAXBCNT(R5)
+        BGEQ    20$
+        MOVL    R1,UCB$L_MAXBCNT(R5)
+20$:    MOVL    R2,DPCB_L_SCDT(R6)
+        MOVL    R4,DPCB_L_PDT(R6)
+        MOVL    R4,UCB$L_PDT(R5)
+
+; Do not issue an SPI command from UNIT_INIT.  The installed VAX V7.3
+; GKDRIVER establishes the port connection here but performs no SPI I/O, and
+; a live V0.6 test proved that SPI$SEND_COMMAND cannot resume this context.
+; The first STARTIO request reads and caches the fixed hardware address before
+; dispatching its operation.  A normal LAN client starts its port before
+; issuing SENSEMODE, so that request also supplies the initialization context.
+
+        BISL    #DP_CONTROLLER_M_READY,DPCB_L_FLAGS(R6)
+        BISW    #UCB$M_ONLINE,UCB$W_STS(R5)
+.IF DEFINED DP$VCI_FRONTEND
+; Capture only.  DP_VCI_CAPTURE never writes the live LAN block.  V0.24 can
+; interpose callbacks later only through its privileged STARTIO control path.
+        BSBW    DP_VCI_CAPTURE
+        MOVZWL  #SS$_NORMAL,R0
+.ENDC
+90$:    POPL    R6
+        RSB
+
+; Initialize a cloned protocol-port UCB.  IOC supplies R2 = clone and
+; R5 = template at IPL$_ASTDEL.  R2 and R5 are preserved.  The clone receives
+; only a reference to the already-connected controller; it never reconnects
+; SCSI and never derives a target or LUN from its clone unit number.
+
+DP_CLONED_UCB:
+        MOVL    UCB_L_DP_CONTROLLER(R5),R0
+        BEQL    90$
+        CMPL    DPCB_L_MAGIC(R0),#DP_CONTROLLER_MAGIC
+        BNEQ    90$
+        BBC     #DP_CONTROLLER_V_READY,DPCB_L_FLAGS(R0),90$
+        MOVL    R0,UCB_L_DP_CONTROLLER(R2)
+        DP_INIT_PORT UCB=R2
+        MOVL    DPCB_L_PDT(R0),UCB$L_PDT(R2)
+        MOVL    UCB$L_MAXBCNT(R5),UCB$L_MAXBCNT(R2)
+        BISW    #UCB$M_ONLINE,UCB$W_STS(R2)
+        MOVZWL  #SS$_NORMAL,R0
+        RSB
+90$:    BICW    #UCB$M_ONLINE,UCB$W_STS(R2)
+        MOVZWL  #SS$_DEVOFFLINE,R0
+        RSB
+
+.IF DEFINED DP$VCI_FRONTEND
+; ----- Optional public VCI frontend -------------------------------------
+;
+; Merely loading or connecting the optional image still captures addresses but
+; does not alter NET$AR_LAN_VECTOR.  A privileged private control QIO performs
+; an explicit, fail-closed install or removal later in ordinary STARTIO.
+
+DP_VCI_CAPTURE:
+        MOVL    G^NET$AR_LAN_VECTOR,R0
+        BNEQ    1$
+        BRW     90$
+1$:
+        CMPL    LAN$L_VERSION(R0),#1
+        BEQL    2$
+        BRW     90$
+2$:
+        TSTL    LAN$A_GET_DEVICE(R0)
+        BNEQ    3$
+        BRW     90$
+3$:
+        TSTL    LAN$A_CREATE_PORT(R0)
+        BNEQ    4$
+        BRW     90$
+4$:
+        TSTL    LAN$A_DELETE_PORT(R0)
+        BNEQ    5$
+        BRW     90$
+5$:
+; USER4 is the OpenVMS site-reserved static SYSGEN longword selected for the
+; DaynaPORT receive-pool size.  Capture it once while the controller is being
+; initialized; changing USER4 later cannot resize resident nonpaged storage
+; behind an active VCI port.  Zero and out-of-range values fail safely to the
+; compiled default.  USERD1/USERD2 are deliberately avoided because installed
+; V7.3 SCSI drivers consume them as debugging controls.
+        MOVL    G^SGN$GL_USER4,R1
+        BEQL    51$
+        CMPL    R1,#DP_VCI_RCV_MIN
+        BLSSU   51$
+        CMPL    R1,#DP_VCI_RCV_MAX
+        BLEQU   52$
+51$:    MOVL    #DP_VCI_RCV_DEFAULT,R1
+52$:    MOVW    R1,DP_VCI_LDC+LDC$W_RCVSIZE
+        MOVL    R1,DP_VCI_LDC+LDC$L_RCVMAX
+        MOVL    R1,DP_VCI_LDC+LDC$L_RCVDES
+; SYSGEN maps a loadable driver without applying the .ADDRESS image fixup used
+; by a normal image activator.  Form this resident pointer only after the
+; driver has its final system virtual address.
+        MOVAB   DP_VCI_NAME,DP_VCI_LDC+LDC$A_NAME
+        MOVL    R5,DP_VCI_TEMPLATE_UCB
+        MOVL    R0,DP_VCI_LAN_BLOCK
+        MOVL    LAN$A_GET_DEVICE(R0),DP_VCI_ORIGINAL_GET
+        MOVL    LAN$A_CREATE_PORT(R0),DP_VCI_ORIGINAL_CREATE
+        MOVL    LAN$A_DELETE_PORT(R0),DP_VCI_ORIGINAL_DELETE
+        MOVZWL  #SS$_NORMAL,R0
+        RSB
+90$:    MOVZWL  #SS$_UNSUPPORTED,R0
+        RSB
+
+; Validate the captured VAX V7.3 LAN table and this controller before any live
+; callback comparison.  R6 is the DPCB and R2 returns the live LAN block.
+
+DP_VCI_VALIDATE_CONTEXT:
+        MOVL    G^NET$AR_LAN_VECTOR,R2
+        BNEQ    1$
+        BRW     90$
+1$:     CMPL    R2,DP_VCI_LAN_BLOCK
+        BEQL    2$
+        BRW     90$
+2$:     CMPL    LAN$L_VERSION(R2),#1
+        BEQL    3$
+        BRW     90$
+3$:     TSTL    DP_VCI_TEMPLATE_UCB
+        BNEQ    4$
+        BRW     90$
+4$:     CMPL    DPCB_L_TEMPLATE_UCB(R6),DP_VCI_TEMPLATE_UCB
+        BEQL    5$
+        BRW     90$
+5$:     MOVL    DP_VCI_TEMPLATE_UCB,R0
+        CMPL    UCB_L_DP_CONTROLLER(R0),R6
+        BEQL    6$
+        BRW     90$
+6$:     BBS     #DP_CONTROLLER_V_READY,DPCB_L_FLAGS(R6),7$
+        BRW     80$
+7$:     BBS     #DP_CONTROLLER_V_MAC_VALID,DPCB_L_FLAGS(R6),8$
+        BRW     80$
+8$:     TSTL    DP_VCI_ORIGINAL_GET
+        BNEQ    9$
+        BRW     90$
+9$:     TSTL    DP_VCI_ORIGINAL_CREATE
+        BNEQ    10$
+        BRW     90$
+10$:    TSTL    DP_VCI_ORIGINAL_DELETE
+        BNEQ    11$
+        BRW     90$
+11$:    MOVAB   DP_VCI_NAME,R0
+        CMPL    DP_VCI_LDC+LDC$A_NAME,R0
+        BEQL    12$
+        BRW     90$
+12$:    MOVZWL  #SS$_NORMAL,R0
+        CLRL    R1
+        RSB
+80$:    MOVZWL  #SS$_DEVOFFLINE,R0
+        CLRL    R1
+        RSB
+90$:    MOVZWL  #SS$_UNSUPPORTED,R0
+        CLRL    R1
+        RSB
+
+; No queued or live protocol work may cross a callback-table transition.  The
+; current control IRP owns BUSY and the sole SCDRP, so those two fields are not
+; part of this drain predicate.  The persistent receive free pool may remain
+; allocated; it is lower-owned resident storage and has no upper callback.
+
+DP_VCI_VALIDATE_DRAINED:
+        TSTL    DPCB_L_ACTIVE_PORTS(R6)
+        BEQL    1$
+        BRW     90$
+1$:     BBC     #DP_CONTROLLER_V_ENABLED,DPCB_L_FLAGS(R6),11$
+        BRW     90$
+11$:    TSTL    DPCB_L_VCI_ACTIVE_PORTS(R6)
+        BEQL    2$
+        BRW     90$
+2$:     TSTL    DPCB_L_VCI_PORTS(R6)
+        BEQL    3$
+        BRW     90$
+3$:     TSTL    DPCB_L_VCI_ACTIVE_VCRP(R6)
+        BEQL    4$
+        BRW     90$
+4$:     TSTL    DPCB_L_VCI_ACTIVE_VCIB(R6)
+        BEQL    5$
+        BRW     90$
+5$:     TSTL    DPCB_L_VCI_ACTIVE_RCV(R6)
+        BEQL    6$
+        BRW     90$
+6$:     MOVAL   DPCB_L_WAITQ_FL(R6),R0
+        CMPL    (R0),R0
+        BEQL    7$
+        BRW     90$
+7$:     MOVAL   DPCB_L_VCIQ_FL(R6),R0
+        CMPL    (R0),R0
+        BEQL    8$
+        BRW     90$
+8$:     BITL    #<DP_CTL_M_VCI_POLL!DP_CTL_M_VCI_TIMER>,-
+                DPCB_L_FLAGS(R6)
+        BEQL    10$
+        BRW     90$
+10$:    MOVZWL  #SS$_NORMAL,R0
+        CLRL    R1
+        RSB
+90$:    MOVZWL  #SS$_DEVACTIVE,R0
+        CLRL    R1
+        RSB
+
+; Compare all three pointers as one logical state.  A mixed or foreign table
+; is never repaired: overwriting it could detach another resident component.
+
+DP_VCI_CALLBACKS_ORIGINAL:
+        CMPL    LAN$A_GET_DEVICE(R2),DP_VCI_ORIGINAL_GET
+        BEQL    1$
+        BRW     90$
+1$:     CMPL    LAN$A_CREATE_PORT(R2),DP_VCI_ORIGINAL_CREATE
+        BEQL    2$
+        BRW     90$
+2$:     CMPL    LAN$A_DELETE_PORT(R2),DP_VCI_ORIGINAL_DELETE
+        BEQL    10$
+        BRW     90$
+10$:    MOVZWL  #SS$_NORMAL,R0
+        CLRL    R1
+        RSB
+90$:    MOVZWL  #SS$_DEVACTIVE,R0
+        CLRL    R1
+        RSB
+
+DP_VCI_CALLBACKS_WRAPPED:
+        MOVAL   DP_VCI_GET_DEVICE,R0
+        CMPL    LAN$A_GET_DEVICE(R2),R0
+        BEQL    1$
+        BRW     90$
+1$:     MOVAL   DP_VCI_CREATE_PORT,R0
+        CMPL    LAN$A_CREATE_PORT(R2),R0
+        BEQL    2$
+        BRW     90$
+2$:     MOVAL   DP_VCI_DELETE_PORT,R0
+        CMPL    LAN$A_DELETE_PORT(R2),R0
+        BEQL    10$
+        BRW     90$
+10$:    MOVZWL  #SS$_NORMAL,R0
+        CLRL    R1
+        RSB
+90$:    MOVZWL  #SS$_DEVACTIVE,R0
+        CLRL    R1
+        RSB
+
+; Publish DELETE first, CREATE second, and GET last.  GET is the discovery
+; boundary, so no new client can discover XQA until all ownership callbacks
+; are present.  Aligned VAX longword stores are atomic; the operational
+; contract additionally requires installation before LAN client startup.
+
+DP_VCI_INSTALL_HOOKS:
+        PUSHR   #^M<R2,R3,R4,R5>
+        BSBW    DP_VCI_VALIDATE_CONTEXT
+        BLBS    R0,1$
+        BRW     80$
+1$:     BBS     #DP_CTL_V_VCI_HOOKED,DPCB_L_FLAGS(R6),2$
+        BRW     3$
+2$:     BSBW    DP_VCI_CALLBACKS_WRAPPED
+        BRW     80$
+3$:     BSBW    DP_VCI_VALIDATE_DRAINED
+        BLBS    R0,4$
+        BRW     80$
+4$:     BSBW    DP_VCI_CALLBACKS_ORIGINAL
+        BLBS    R0,5$
+        BRW     80$
+5$:     MOVAL   DP_VCI_DELETE_PORT,R0
+        MOVL    R0,LAN$A_DELETE_PORT(R2)
+        MOVAL   DP_VCI_CREATE_PORT,R0
+        MOVL    R0,LAN$A_CREATE_PORT(R2)
+        MOVAL   DP_VCI_GET_DEVICE,R0
+        MOVL    R0,LAN$A_GET_DEVICE(R2)
+        BISL    #DP_CTL_M_VCI_HOOKED,DPCB_L_FLAGS(R6)
+        MOVZWL  #SS$_NORMAL,R0
+        CLRL    R1
+80$:    POPR    #^M<R2,R3,R4,R5>
+        RSB
+
+; Stop advertising XQA first, then restore CREATE and DELETE.  Removal is
+; idempotent only when the entire live table is already the captured original.
+; Otherwise a state mismatch fails closed with SS$_DEVACTIVE.
+
+DP_VCI_REMOVE_HOOKS:
+        PUSHR   #^M<R2,R3,R4,R5>
+        BSBW    DP_VCI_VALIDATE_CONTEXT
+        BLBS    R0,1$
+        BRW     80$
+1$:     BBS     #DP_CTL_V_VCI_HOOKED,DPCB_L_FLAGS(R6),3$
+        BRW     2$
+2$:     BSBW    DP_VCI_CALLBACKS_ORIGINAL
+        BRW     80$
+3$:     BSBW    DP_VCI_CALLBACKS_WRAPPED
+        BLBS    R0,4$
+        BRW     80$
+4$:     BSBW    DP_VCI_VALIDATE_DRAINED
+        BLBS    R0,5$
+        BRW     80$
+5$:     MOVL    DP_VCI_ORIGINAL_GET,LAN$A_GET_DEVICE(R2)
+        MOVL    DP_VCI_ORIGINAL_CREATE,LAN$A_CREATE_PORT(R2)
+        MOVL    DP_VCI_ORIGINAL_DELETE,LAN$A_DELETE_PORT(R2)
+        BICL    #DP_CTL_M_VCI_HOOKED,DPCB_L_FLAGS(R6)
+        MOVZWL  #SS$_NORMAL,R0
+        CLRL    R1
+80$:    POPR    #^M<R2,R3,R4,R5>
+        RSB
+
+; Preserve the original enumeration order and append the synthetic XQA LDC
+; only after the resident routine reports no next device.  The LDC address is
+; also an opaque enumeration ID; intercept it before calling the resident
+; routine, which expects its IDs to be private LSB addresses.
+
+DP_VCI_GET_DEVICE:
+        MOVAL   DP_VCI_LDC,R1
+        CMPL    R0,R1
+        BNEQ    1$
+        BRW     20$
+1$:
+        TSTL    DP_VCI_ORIGINAL_GET
+        BEQL    10$
+        JSB     @DP_VCI_ORIGINAL_GET
+        TSTL    R1
+        BNEQ    30$
+10$:    MOVAL   DP_VCI_LDC,R0
+        MOVAL   DP_VCI_LDC,R1
+        RSB
+20$:    CLRL    R1
+30$:    RSB
+
+; Identify only the documented DLL$K_LAN_DEVICE item containing an exact
+; three-character counted XQA name.  Every absent, unknown, entity-based, or
+; malformed case is forwarded to the resident create routine unchanged.
+; An exact XQA request reaches the V0.28 clone helper.  That helper fails closed
+; until the controller is ready, a normal STARTIO request has cached its MAC,
+; and the lower-owned receive pool has reached its documented minimum.
+
+DP_VCI_CREATE_PORT:
+        PUSHR   #^M<R1,R2,R3,R5,R6>
+        MOVL    VCIB$A_DLL_INPUT_LIST(R4),R1
+        BNEQ    11$
+        BRW     80$
+11$:
+        MOVL    LIL$A_LISTADR(R1),R2
+        BNEQ    12$
+        BRW     80$
+12$:
+        MOVL    LIL$L_LISTLEN(R1),R3
+10$:    CMPL    R3,#LIL$T_ITEMVAL
+        BGTRU   13$
+        BRW     80$
+13$:
+        CMPW    #DLL$K_LAN_DEVICE,LIL$W_ITEMTAG(R2)
+        BNEQ    14$
+        BRW     30$
+14$:
+        MOVZWL  LIL$W_ITEMLEN(R2),R0
+        CMPL    R0,#LIL$T_ITEMVAL
+        BGEQU   15$
+        BRW     80$
+15$:
+        CMPL    R0,R3
+        BLEQU   16$
+        BRW     80$
+16$:
+        ADDL    R0,R2
+        SUBL    R0,R3
+        BRW     10$
+30$:    CMPW    #8,LIL$W_ITEMLEN(R2)
+        BEQL    31$
+        BRW     80$
+31$:
+        MOVL    LIL$T_ITEMVAL(R2),R1
+        BNEQ    32$
+        BRW     80$
+32$:
+        CMPL    (R1),DP_VCI_NAME
+        BEQL    33$
+        BRW     80$
+33$:
+        BSBW    DP_VCI_CLONE_PORT
+        POPR    #^M<R1,R2,R3,R5,R6>
+        RSB
+80$:    POPR    #^M<R1,R2,R3,R5,R6>
+        TSTL    DP_VCI_ORIGINAL_CREATE
+        BEQL    90$
+        JSB     @DP_VCI_ORIGINAL_CREATE
+        RSB
+90$:    MOVZWL  #SS$_NOSUCHDEV,R0
+        RSB
+
+; Delete only a port whose LDC identifies this frontend.  All foreign ports
+; remain owned by the resident implementation and are forwarded unchanged.
+
+DP_VCI_DELETE_PORT:
+        MOVAL   DP_VCI_LDC,R0
+        CMPL    VCIB$A_LAN_LDC(R4),R0
+        BEQL    80$
+        TSTL    DP_VCI_ORIGINAL_DELETE
+        BEQL    90$
+        JSB     @DP_VCI_ORIGINAL_DELETE
+        RSB
+80$:    BSBW    DP_VCI_DELETE_OWN_PORT
+        RSB
+90$:    MOVZWL  #SS$_NOSUCHDEV,R0
+        RSB
+
+; V0.28 clone contract recovered from the resident VAX LAN implementation.
+; MAC_VALID is deliberately stronger than READY: SPI$SEND_COMMAND cannot
+; resume from UNIT_INIT on this target, so startup must first issue the proven
+; bounded DEACCESS primer through ordinary STARTIO before LAN creates XQA.
+; TCP/IP Services V5.1 leaves the dynamic-header VCIB$W_SIZE field zero.  The
+; resident VAX LAN create routine does not inspect that field and initializes
+; the fixed LAN VCIB through VCIB$A_LAN_PHA.  Accept zero as the legacy
+; unspecified-size encoding, but continue to reject an explicit short size.
+
+DP_VCI_CLONE_PORT:
+        MOVW    #1,VCIB$W_VERSION_LOWER(R4)
+        TSTW    VCIB$W_VERSION_UPPER(R4)
+        BNEQ    10$
+        BRW     80$
+10$:
+        TSTL    VCIB$A_LAN_UCB(R4)
+        BEQL    11$
+        BRW     87$
+11$:
+        MOVL    DP_VCI_TEMPLATE_UCB,R5
+        BNEQ    12$
+        BRW     80$
+12$:
+        MOVL    UCB_L_DP_CONTROLLER(R5),R6
+        BNEQ    13$
+        BRW     80$
+13$:
+        CMPL    DPCB_L_MAGIC(R6),#DP_CONTROLLER_MAGIC
+        BEQL    14$
+        BRW     80$
+14$:
+        BBS     #DP_CONTROLLER_V_READY,DPCB_L_FLAGS(R6),15$
+        BRW     80$
+15$:
+        BBS     #DP_CONTROLLER_V_MAC_VALID,DPCB_L_FLAGS(R6),16$
+        BRW     80$
+16$:
+        MOVZWL  VCIB$W_SIZE(R4),R0
+        MOVL    R0,DPCB_L_VCI_CREATE_SIZE(R6)
+        MOVL    #DP_VCI_CREATE_S_ENTER,DPCB_L_VCI_CREATE_STAGE(R6)
+        TSTW    R0
+        BEQL    161$
+        CMPW    R0,#VCIB$K_LAN_FIXED_LENGTH
+        BGEQU   161$
+        MOVL    #DP_VCI_CREATE_S_SIZE,DPCB_L_VCI_CREATE_STAGE(R6)
+        BRW     85$
+161$:
+        MOVL    #DP_VCI_CREATE_S_POOL,DPCB_L_VCI_CREATE_STAGE(R6)
+        BSBW    DP_VCI_FILL_RECEIVE_POOL
+        BLBS    R0,162$
+        BRW     90$
+162$:
+        MOVL    #DP_VCI_CREATE_S_CLONE,DPCB_L_VCI_CREATE_STAGE(R6)
+        JSB     G^IOC$CLONE_UCB
+        BLBS    R0,17$
+        BRW     90$
+17$:
+        BISL    #UCB$M_DELETEUCB,UCB$L_STS(R2)
+        MOVL    UCB$L_DDT(R5),R1
+        PUSHL   R4
+        CLRL    R4
+        MOVL    #DP_VCI_CREATE_S_DDT,DPCB_L_VCI_CREATE_STAGE(R6)
+        JSB     @DP_VCI_DDT_CLONEDUCB(R1)
+        MOVL    (SP)+,R4
+        BLBS    R0,171$
+        BRW     70$
+171$:
+        MOVL    R4,UCB_L_DP_VCIB(R2)
+; The resident VAX V7.3 LAN driver returns two distinct, UCB-owned six-byte
+; address cells.  The template PHA is all ones until ENABLE supplies or
+; defaults a physical address; HWA always contains the factory address.
+; Keep both cells quadword-sized so every MOVL/MOVW consumer is naturally
+; aligned and the two unused tail bytes are deterministic.
+        MOVL    DPCB_B_MAC_REPLY(R6),UCB_Q_DP_HWA(R2)
+        MOVW    DPCB_B_MAC_REPLY+4(R6),UCB_Q_DP_HWA+4(R2)
+        CLRW    UCB_Q_DP_HWA+6(R2)
+        MOVL    #-1,UCB_Q_DP_PHA(R2)
+        MOVW    #-1,UCB_Q_DP_PHA+4(R2)
+        CLRW    UCB_Q_DP_PHA+6(R2)
+; The resident VAX CSMACD drivers leave LAN_LPB zero even on active ports.
+; No DP path consumes this upper-visible field; controller ownership stays in
+; the cloned UCB's private back-pointer instead.
+        CLRL    VCIB$A_LAN_LPB(R4)
+        MOVL    R2,VCIB$A_LAN_UCB(R4)
+        MOVAB   DP_VCI_PORTMGMT,VCIB$A_PORTMGMT_INITIATE(R4)
+        MOVAB   DP_VCI_TRANSMIT,VCIB$A_TRANSMIT_INITIATE(R4)
+        MOVAB   DP_VCI_BUILD_HDR,VCIB$A_LAN_BUILD_HDR(R4)
+        MOVAB   DP_VCI_TRANSMIT_FRAME,-
+                VCIB$A_LAN_TRANSMIT_FRAME(R4)
+        MOVAB   DP_VCI_TRANSMIT_AVAILABLE,-
+                VCIB$A_LAN_TRANSMIT_AVAIL(R4)
+        MOVAL   DP_VCI_LDC,VCIB$A_LAN_LDC(R4)
+        MOVAB   UCB_Q_DP_HWA(R2),VCIB$A_LAN_HWA(R4)
+        MOVAB   UCB_Q_DP_PHA(R2),VCIB$A_LAN_PHA(R4)
+; The installed VAX V7.3 VCIBDLL layout reserves +128..+139.  Unlike the
+; Alpha V7.3 layout, it exports no LAN reset callback, and the resident VAX
+; LAN initializer leaves those bytes untouched.
+        MOVW    #VCIB$M_DLL_XMT_CHAIN,VCIB$W_DLL_FLAGS(R4)
+        MOVW    #VCIB$K_DLL_CSMACD,VCIB$W_DLL_TYPE(R4)
+        MOVW    #DP_ETH_HEADER,VCIB$W_DLL_HDR_SIZE(R4)
+        MOVW    #1500,VCIB$W_DLL_XMT_SIZE(R4)
+        CLRW    VCIB$W_DLL_CHAIN_SIZE(R4)
+        CLRW    VCIB$W_LAN_OUT_RCV(R4)
+        CLRW    VCIB$W_LAN_FLAGS(R4)
+        CLRL    VCIB$L_LAN_OOCNT(R4)
+        CLRL    VCIB$A_LAN_DP_VCRP(R4)
+        MOVL    DPCB_L_VCI_PORTS(R6),UCB_L_DP_VCI_NEXT(R2)
+        MOVL    R2,DPCB_L_VCI_PORTS(R6)
+        MOVL    #DP_VCI_CREATE_S_DONE,DPCB_L_VCI_CREATE_STAGE(R6)
+        MOVZWL  #SS$_NORMAL,R0
+        RSB
+70$:    PUSHL   R0
+        MOVL    R2,R5
+        DECW    UCB$W_REFC(R5)
+        JSB     G^IOC$DELETE_UCB
+        POPL    R0
+        RSB
+80$:    MOVZWL  #SS$_DEVOFFLINE,R0
+        RSB
+85$:    MOVZWL  #SS$_IVBUFLEN,R0
+        RSB
+87$:    MOVZWL  #SS$_DEVACTIVE,R0
+90$:    RSB
+
+; Only a clone whose private back-pointer matches the supplied VCIB may be
+; deleted.  A started or transitioning port, an outstanding request, or an
+; upper-owned receive VCRP must first be drained by the normal VCI lifecycle.
+
+DP_VCI_DELETE_OWN_PORT:
+        PUSHR   #^M<R1,R2,R3,R5,R6>
+        MOVL    VCIB$A_LAN_UCB(R4),R5
+        BNEQ    801$
+        BRW     DP_VCI_DELETE_NOSUCH
+801$:
+        CMPL    UCB_L_DP_VCIB(R5),R4
+        BEQL    802$
+        BRW     DP_VCI_DELETE_NOSUCH
+802$:
+        BITL    #<DP_PORT_M_STARTED!DP_PORT_M_STARTING!DP_PORT_M_STOPPING>,-
+                UCB_L_DP_PORT_FLAGS(R5)
+        BEQL    803$
+        BRW     DP_VCI_DELETE_ACTIVE
+803$:
+        TSTL    VCIB$L_LAN_OOCNT(R4)
+        BEQL    804$
+        BRW     DP_VCI_DELETE_ACTIVE
+804$:
+        TSTW    VCIB$W_LAN_OUT_RCV(R4)
+        BEQL    805$
+        BRW     DP_VCI_DELETE_ACTIVE
+805$:
+        MOVL    UCB_L_DP_CONTROLLER(R5),R6
+        BNEQ    806$
+        BRW     DP_VCI_DELETE_NOSUCH
+806$:
+        MOVAL   DPCB_L_VCI_PORTS(R6),R1
+10$:    MOVL    (R1),R2
+        BNEQ    101$
+        BRW     DP_VCI_DELETE_NOSUCH
+101$:
+        CMPL    R2,R5
+        BEQL    11$
+        MOVAL   UCB_L_DP_VCI_NEXT(R2),R1
+        BRB     10$
+11$:    MOVL    UCB_L_DP_VCI_NEXT(R5),(R1)
+        CLRL    UCB_L_DP_VCI_NEXT(R5)
+        CLRL    UCB_L_DP_VCIB(R5)
+        DECW    UCB$W_REFC(R5)
+        JSB     G^IOC$DELETE_UCB
+        CLRL    VCIB$A_LAN_LPB(R4)
+        CLRL    VCIB$A_LAN_UCB(R4)
+        CLRL    VCIB$A_PORTMGMT_INITIATE(R4)
+        CLRL    VCIB$A_TRANSMIT_INITIATE(R4)
+        CLRL    VCIB$A_LAN_BUILD_HDR(R4)
+        CLRL    VCIB$A_LAN_TRANSMIT_FRAME(R4)
+        CLRL    VCIB$A_LAN_TRANSMIT_AVAIL(R4)
+        CLRL    VCIB$A_LAN_LDC(R4)
+        CLRL    VCIB$A_LAN_HWA(R4)
+        CLRL    VCIB$A_LAN_PHA(R4)
+        CLRW    VCIB$W_VERSION_LOWER(R4)
+        CLRW    VCIB$W_DLL_FLAGS(R4)
+        CLRW    VCIB$W_DLL_TYPE(R4)
+        CLRW    VCIB$W_DLL_HDR_SIZE(R4)
+        CLRW    VCIB$W_DLL_XMT_SIZE(R4)
+        CLRW    VCIB$W_DLL_CHAIN_SIZE(R4)
+        CLRW    VCIB$W_LAN_OUT_RCV(R4)
+        CLRW    VCIB$W_LAN_FLAGS(R4)
+        CLRL    VCIB$L_LAN_OOCNT(R4)
+        CLRL    VCIB$A_LAN_DP_VCRP(R4)
+        MOVZWL  #SS$_NORMAL,R0
+        POPR    #^M<R1,R2,R3,R5,R6>
+        RSB
+DP_VCI_DELETE_NOSUCH:
+        MOVZWL  #SS$_NOSUCHDEV,R0
+        POPR    #^M<R1,R2,R3,R5,R6>
+        RSB
+DP_VCI_DELETE_ACTIVE:
+        MOVZWL  #SS$_DEVACTIVE,R0
+        POPR    #^M<R1,R2,R3,R5,R6>
+        RSB
+
+; Allocate the lower-owned receive VCRPs described by the LDC.  A VCRP begins
+; with its own standard DYN header, so this path intentionally calls
+; EXE$ALONONPAGED directly rather than DP_ALLOC_POOL, whose returned payload
+; skips a private DYN header.  A partial pool is usable only when the LDC
+; minimum of one buffer has been reached.
+
+DP_VCI_FILL_RECEIVE_POOL:
+        PUSHR   #^M<R1,R2,R3,R4,R5>
+10$:    CMPL    DPCB_L_VCI_RCV_COUNT(R6),-
+                DP_VCI_LDC+LDC$L_RCVDES
+        BLSSU   11$
+        BRW     30$
+11$:
+        MOVL    #<VCRP$T_LAN_DATA+DP_RX_MAX>,R1
+        JSB     G^EXE$ALONONPAGED
+        BLBS    R0,21$
+        BRW     20$
+21$:
+        PUSHR   #^M<R0,R1,R2,R3,R4,R5>
+        MOVC5   #0,.,#0,R1,(R2)
+        POPR    #^M<R0,R1,R2,R3,R4,R5>
+        MOVW    R1,VCRP$W_SIZE(R2)
+        MOVB    #DYN$C_VCRP,VCRP$B_TYPE(R2)
+        MOVL    #VCRP$K_FC_RECEIVE,VCRP$L_FUNCTION(R2)
+        INSQUE  (R2),@DPCB_L_VCI_RCVQ_BL(R6)
+        INCL    DPCB_L_VCI_RCV_COUNT(R6)
+        BRW     10$
+20$:    TSTL    DPCB_L_VCI_RCV_COUNT(R6)
+        BNEQ    30$
+        MOVZWL  #SS$_INSFMEM,R0
+        BRB     40$
+30$:    MOVL    DPCB_L_VCI_RCV_COUNT(R6),-
+                DP_VCI_LDC+LDC$L_RCVCUR
+        MOVZWL  #SS$_NORMAL,R0
+40$:    POPR    #^M<R1,R2,R3,R4,R5>
+        RSB
+
+; Start one repeating system-subroutine timer per active controller.  This is
+; called with the controller's IOLOCK8 fork lock held after a successful VCI
+; ENABLE.  The target
+; definitions are VAX-specific: TQE length 0x34, FR3 at 0x10, TIME at 0x18,
+; and DELTA at 0x20.  The target layout used here was validated before the
+; VCI frontend was enabled.
+
+DP_VCI_START_POLLER:
+        PUSHR   #^M<R0,R1,R2,R3,R4,R5>
+        BBSS    #DP_CTL_V_VCI_TIMER,-
+                DPCB_L_FLAGS(R6),301$
+        BRW     302$
+301$:   BRW     30$
+302$:
+        MOVAL   DPCB_B_VCI_TQE(R6),R5
+        ASSUME  TQE$B_TYPE EQ TQE$W_SIZE+2
+        ASSUME  TQE$B_RQTYPE EQ TQE$B_TYPE+1
+        MOVL    #<<TQE$C_SSREPT@24>!<DYN$C_TQE@16>!TQE$C_LENGTH>,-
+                TQE$W_SIZE(R5)
+        MOVQ    #DP_VCI_POLL_DELTA,TQE$Q_DELTA(R5)
+        MOVL    R6,TQE$L_FR3(R5)
+        CLRL    TQE$L_FR4(R5)
+        MOVAB   DP_VCI_POLL_TIMER,TQE$L_FPC(R5)
+        MOVQ    G^EXE$GQ_SYSTIME,R0
+        ADDL    TQE$Q_DELTA(R5),R0
+        ADWC    TQE$Q_DELTA+4(R5),R1
+        JSB     G^EXE$INSTIMQ
+30$:    POPR    #^M<R0,R1,R2,R3,R4,R5>
+        RSB
+
+; The timer scheduler supplies FR3 in R3 and the TQE in R5.  Serialize the
+; pending bit and BUSY ownership under the template UCB's IOLOCK8 fork lock.
+; A busy controller merely remembers the poll; DP_RELEASE_CONTROLLER gives
+; ordinary IRPs and upper VCRPs priority before scheduling it.  When READY,
+; ENABLED, or active-port state disappears, return EXE$AR_TQENOREPT exactly as
+; TIMESCHDL requires and make the embedded TQE available for a later ENABLE.
+
+DP_VCI_POLL_TIMER:
+        PUSHR   #^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+        MOVL    R3,R6
+        CMPL    DPCB_L_MAGIC(R6),#DP_CONTROLLER_MAGIC
+        BEQL    41$
+        BRW     50$
+41$:
+        MOVL    DPCB_L_TEMPLATE_UCB(R6),R5
+        BNEQ    42$
+        BRW     50$
+42$:
+        FORKLOCK UCB$B_FLCK(R5),SAVIPL=-(SP),PRESERVE=YES
+        BBS     #DP_CONTROLLER_V_READY,DPCB_L_FLAGS(R6),31$
+        BRW     45$
+31$:
+        BBS     #DP_CONTROLLER_V_ENABLED,DPCB_L_FLAGS(R6),32$
+        BRW     45$
+32$:
+        TSTL    DPCB_L_VCI_ACTIVE_PORTS(R6)
+        BNEQ    33$
+        BRW     45$
+33$:
+        MOVAL   DPCB_L_VCI_RCVQ_FL(R6),R0
+        CMPL    (R0),R0
+        BNEQ    341$
+        INCL    DPCB_L_VCI_RCV_NO_BUFFER_COUNT(R6)
+        BRW     30$
+341$:
+        BBSS    #DP_CTL_V_VCI_POLL,-
+                DPCB_L_FLAGS(R6),35$
+        BRW     36$
+35$:    BRW     30$
+36$:
+        BBSS    #DP_CONTROLLER_V_BUSY,DPCB_L_FLAGS(R6),37$
+        BRW     38$
+37$:    BRW     30$
+38$:
+        MOVL    R6,R4
+        MOVAL   DPCB_B_WAIT_FKB(R6),R5
+        BSBW    DP_SCHEDULE_CONTROLLER_FORK
+        MOVL    DPCB_L_TEMPLATE_UCB(R6),R5
+30$:    FORKUNLOCK UCB$B_FLCK(R5),NEWIPL=(SP)+,PRESERVE=YES
+40$:    MOVAL   DPCB_B_VCI_TQE(R6),R5
+        MOVQ    G^EXE$GQ_SYSTIME,R0
+        MOVQ    R0,TQE$Q_TIME(R5)
+        POPR    #^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+        RSB
+45$:    BICL    #DP_CTL_M_VCI_TIMER,DPCB_L_FLAGS(R6)
+        FORKUNLOCK UCB$B_FLCK(R5),NEWIPL=(SP)+,PRESERVE=YES
+50$:    POPR    #^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+        MOVL    G^EXE$AR_TQENOREPT,R5
+        RSB
+
+; Return callback installed in every delivered receive VCRP.  The VCI ABI
+; permits this routine to destroy only R3.  Creator data keeps the optional
+; limited-receive VCIB in the low longword and the owning DPCB in the high
+; longword, matching the resident VAX LAN implementation.
+
+DP_VCI_RETURN_RECEIVE:
+        PUSHR   #^M<R0,R1,R2,R4,R5,R6>
+        MOVL    R3,R2
+        MOVL    VCRP$Q_CREATOR_DATA(R2),R4
+        BEQL    10$
+        TSTW    VCIB$W_LAN_OUT_RCV(R4)
+        BEQL    10$
+        DECW    VCIB$W_LAN_OUT_RCV(R4)
+10$:    MOVL    VCRP$Q_CREATOR_DATA+4(R2),R6
+        BEQL    20$
+        CMPL    DPCB_L_MAGIC(R6),#DP_CONTROLLER_MAGIC
+        BNEQ    20$
+        INCL    DPCB_L_VCI_RCV_RETURN_COUNT(R6)
+        CLRL    VCRP$A_DEALLOC_RTN(R2)
+        CLRQ    VCRP$Q_CREATOR_DATA(R2)
+        INSQUE  (R2),@DPCB_L_VCI_RCVQ_BL(R6)
+20$:    POPR    #^M<R0,R1,R2,R4,R5,R6>
+        RSB
+
+; Build-only VCI port-management state machine.  The public callback runs at
+; FLCK with R3 = VCRP and R4 = VCIB and may destroy only R0/R1.  Preserve the
+; remaining registers explicitly, including R3 because the upper completion
+; callback contract permits it to be destroyed.
+;
+; ENABLE accepts the same exclusive-Ethernet scalar P2 subset as the public
+; SETMODE path and commits it transactionally.  CHANGE accepts an empty no-op
+; only: the VCI specification restricts active-port changes to multicast and
+; group-SAP state, neither of which is implemented yet.  DISABLE refuses to
+; start while data VCRPs remain outstanding.  ENABLE and DISABLE transfer the
+; VCRP to a typed controller queue; the shared FKB worker performs the actual
+; DaynaPORT interface CDB and completes or rolls back the transition.
+
+DP_VCI_PORTMGMT:
+        PUSHR   #^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+        INCL    DP_VCI_MGMT_ENTRY_COUNT
+        MOVL    R3,DP_VCI_MGMT_ENTRY_VCRP
+        MOVL    R4,DP_VCI_MGMT_ENTRY_VCIB
+        MOVL    (R3),DP_VCI_MGMT_ENTRY_RAW0
+        MOVL    4(R3),DP_VCI_MGMT_ENTRY_RAW1
+        MOVL    8(R3),DP_VCI_MGMT_ENTRY_RAW2
+        MOVL    12(R3),DP_VCI_MGMT_ENTRY_RAW3
+        MOVZWL  VCRP$W_SIZE(R3),R0
+        MOVL    R0,DP_VCI_MGMT_ENTRY_SIZE
+        MOVZBL  VCRP$B_TYPE(R3),R0
+        MOVL    R0,DP_VCI_MGMT_ENTRY_TYPE
+        MOVL    VCRP$L_FUNCTION(R3),-
+                DP_VCI_MGMT_ENTRY_FUNCTION
+; Retain one bounded copy of the upper client's P2 list while its P2B is still
+; owned and valid.  This avoids relaxing an unknown sequence of attributes one
+; reboot at a time.  MOVC3 destroys R0--R5, so preserve the live VCRP/VCIB and
+; private registers around this diagnostic-only snapshot.
+        PUSHR   #^M<R2,R3,R4,R5>
+        TSTL    DP_VCI_MGMT_P2_SNAPSHOT_SIZE
+        BEQL    101$
+        BRW     109$
+101$:  MOVL    VCRP$L_LAN_P2BUFF_SIZE(R3),R0
+        BNEQ    102$
+        BRW     109$
+102$:  CMPL    R0,#DP_VCI_P2_SNAPSHOT_MAX
+        BLEQU   103$
+        MOVL    #DP_VCI_P2_SNAPSHOT_MAX,R0
+103$:  MOVL    VCRP$A_LAN_P2BUFF(R3),R2
+        BNEQ    104$
+        BRW     109$
+104$:  MOVL    (R2),R3
+        BNEQ    105$
+        BRW     109$
+105$:  MOVL    R0,DP_VCI_MGMT_P2_SNAPSHOT_SIZE
+        MOVC3   R0,(R3),DP_VCI_MGMT_P2_SNAPSHOT
+109$:  POPR    #^M<R2,R3,R4,R5>
+        CLRL    R5
+
+; A missing completion callback cannot be reported safely.  Every normal VCI
+; client supplies it before CREATE_PORT, but fail closed if the contract is
+; violated rather than jumping through zero.
+
+        TSTL    VCIB$A_PORTMGMT_COMPLETE(R4)
+        BNEQ    9$
+        BRW     DP_VCI_PORTMGMT_RETURN
+; TCP/IP Services V5.1 uses the legacy zero dynamic-header size in its VCRPs,
+; just as it does in the VCIB passed to CREATE_PORT.  Zero means unspecified;
+; a nonzero short size remains a malformed request.
+9$:     TSTW    VCRP$W_SIZE(R3)
+        BEQL    10$
+        CMPW    VCRP$W_SIZE(R3),#VCRP$K_FIXED_LENGTH
+        BGEQU   10$
+        BRW     DP_VCI_PORTMGMT_BADPARAM
+10$:    CMPB    VCRP$B_TYPE(R3),#DYN$C_VCRP
+        BEQL    11$
+        BRW     DP_VCI_PORTMGMT_BADPARAM
+
+; Reject stale or foreign VCIB/UCB pairs without the resident LAN driver's
+; fatal bugcheck policy.  The optional frontend is development code and a bad
+; upper-client request must not take down the node.
+
+11$:    MOVL    VCIB$A_LAN_UCB(R4),R5
+        BNEQ    12$
+        BRW     DP_VCI_PORTMGMT_NOSUCHDEV
+12$:    CMPL    UCB_L_DP_VCIB(R5),R4
+        BEQL    13$
+        BRW     DP_VCI_PORTMGMT_NOSUCHDEV
+13$:    MOVL    UCB_L_DP_CONTROLLER(R5),R2
+        BNEQ    14$
+        BRW     DP_VCI_PORTMGMT_OFFLINE
+14$:    CMPL    DPCB_L_MAGIC(R2),#DP_CONTROLLER_MAGIC
+        BEQL    15$
+        BRW     DP_VCI_PORTMGMT_OFFLINE
+15$:    BBS     #DP_CONTROLLER_V_READY,DPCB_L_FLAGS(R2),16$
+        BRW     DP_VCI_PORTMGMT_OFFLINE
+16$:    MOVL    R5,VCRP$A_LAN_UCB(R3)
+
+        MOVL    VCRP$L_FUNCTION(R3),R0
+        MOVL    R0,DPCB_L_VCI_MGMT_FUNCTION(R2)
+        MOVL    VCRP$L_LAN_P2BUFF_SIZE(R3),-
+                DPCB_L_VCI_MGMT_P2_SIZE(R2)
+        CLRL    DPCB_L_VCI_MGMT_STATUS(R2)
+        CLRL    DPCB_L_VCI_MGMT_STATUS2(R2)
+        CMPL    R0,#VCRP$K_FC_ENABLE_PORT
+        BNEQ    17$
+        BRW     DP_VCI_ENABLE_PORT
+17$:    CMPL    R0,#VCRP$K_FC_DISABLE_PORT
+        BNEQ    18$
+        BRW     DP_VCI_DISABLE_PORT
+18$:    CMPL    R0,#VCRP$K_FC_LAN_CHANGE_PORT
+        BEQL    19$
+        BRW     DP_VCI_PORTMGMT_ILLIOFUNC
+19$:    BRW     DP_VCI_CHANGE_PORT
+
+DP_VCI_ENABLE_PORT:
+        BITL    #<DP_PORT_M_STARTED!DP_PORT_M_STARTING!DP_PORT_M_STOPPING>,-
+                UCB_L_DP_PORT_FLAGS(R5)
+        BEQL    20$
+        BRW     DP_VCI_PORTMGMT_ACTIVE
+
+; Load a complete candidate attribute set before examining P2.  The VCI field
+; points to a P2B header whose first longword points at system-space P2 data.
+
+20$:    MOVZWL  UCB_W_DP_PORT_PTY(R5),R9
+        MOVZWL  UCB_W_DP_PORT_BUS(R5),R10
+        MOVZBL  UCB_B_DP_PORT_BFN(R5),R0
+        INSV    R0,#16,#8,R10
+        MOVZBL  UCB_B_DP_PORT_PAD(R5),R0
+        INSV    R0,#24,#8,R10
+        MOVZBL  UCB_B_DP_PORT_ACC(R5),R11
+        CLRL    R8
+        MOVL    VCRP$L_LAN_P2BUFF_SIZE(R3),R7
+        CMPL    R7,#DP_NMA_SET_MAX
+        BLEQU   21$
+        BRW     DP_VCI_PORTMGMT_IVBUFLEN
+21$:    MOVL    VCRP$A_LAN_P2BUFF(R3),R6
+        BNEQ    22$
+        TSTL    R7
+        BNEQ    221$
+        BRW     24$
+221$:
+        BRW     DP_VCI_PORTMGMT_BADPARAM
+22$:    MOVL    (R6),R6
+        BNEQ    23$
+        TSTL    R7
+        BEQL    23$
+        BRW     DP_VCI_PORTMGMT_BADPARAM
+23$:    BSBW    DP_PARSE_SET_ATTRIBUTES
+        BLBS    R0,24$
+        BRW     DP_VCI_PORTMGMT_COMPLETE
+
+; Protocol type is the one mandatory combination field for the current
+; exclusive Ethernet subset.  Preserve the public parser convention of
+; returning the offending NMA item in the second status longword.
+
+24$:    TSTW    R9
+        BNEQ    25$
+        MOVZWL  #SS$_BADPARAM,R0
+        MOVZWL  #NMA$C_PCLI_PTY,R1
+        BRW     DP_VCI_PORTMGMT_COMPLETE
+
+25$:    EXTZV   #24,#8,R10,R0
+        CMPL    R0,#NMA$C_STATE_OFF
+        BNEQ    251$
+        BRW     DP_VCI_ENABLE_COMMIT
+251$:
+        MOVZWL  #SS$_BADPARAM,R0
+        MOVZWL  #NMA$C_PCLI_PAD,R1
+        BRW     DP_VCI_PORTMGMT_COMPLETE
+
+; The first VCI transmit frontend implements the canonical fourteen-byte
+; Ethernet-II header only.  Reject PAD-on rather than silently omitting the
+; extra LAN-common length word.
+
+DP_VCI_ENABLE_COMMIT:
+        MOVW    R9,UCB_W_DP_PORT_PTY(R5)
+        MOVW    R10,UCB_W_DP_PORT_BUS(R5)
+        MOVW    R10,UCB$W_DEVBUFSIZ(R5)
+        EXTZV   #16,#8,R10,R0
+        MOVB    R0,UCB_B_DP_PORT_BFN(R5)
+        EXTZV   #24,#8,R10,R0
+        MOVB    R0,UCB_B_DP_PORT_PAD(R5)
+        MOVB    R11,UCB_B_DP_PORT_ACC(R5)
+; The resident LAN create path initializes PHA to all ones.  This frontend
+; does not accept an alternate physical-address attribute, so ENABLE must
+; default the active address to the factory HWA before reporting PORT_USABLE.
+        MOVL    UCB_Q_DP_HWA(R5),UCB_Q_DP_PHA(R5)
+        MOVW    UCB_Q_DP_HWA+4(R5),UCB_Q_DP_PHA+4(R5)
+        CLRW    UCB_Q_DP_PHA+6(R5)
+        BBC     #DP_ATTR_V_RES,R8,252$
+        MOVB    #NMA$C_LINRES_ENA,UCB_B_DP_PORT_RES(R5)
+252$:
+        BISL    #DP_PORT_M_STARTING,UCB_L_DP_PORT_FLAGS(R5)
+        CLRL    VCRP$A_OUTPUT_LIST(R3)
+        INCL    VCIB$L_LAN_OOCNT(R4)
+        MOVL    UCB_L_DP_CONTROLLER(R5),R6
+        BSBW    DP_VCI_QUEUE_REQUEST
+        BRW     DP_VCI_PORTMGMT_RETURN
+
+DP_VCI_DISABLE_PORT:
+        BITL    #<DP_PORT_M_STARTING!DP_PORT_M_STOPPING>,-
+                UCB_L_DP_PORT_FLAGS(R5)
+        BEQL    26$
+        BRW     DP_VCI_PORTMGMT_ACTIVE
+26$:
+        BBS     #DP_PORT_V_STARTED,UCB_L_DP_PORT_FLAGS(R5),30$
+        BRW     DP_VCI_PORTMGMT_INACTIVE
+30$:    TSTL    VCIB$L_LAN_OOCNT(R4)
+        BEQL    27$
+        BRW     DP_VCI_PORTMGMT_ACTIVE
+27$:
+        TSTW    VCIB$W_LAN_OUT_RCV(R4)
+        BEQL    28$
+        BRW     DP_VCI_PORTMGMT_ACTIVE
+28$:
+        BISL    #DP_PORT_M_STOPPING,UCB_L_DP_PORT_FLAGS(R5)
+        MOVL    UCB_L_DP_CONTROLLER(R5),R6
+        BSBW    DP_VCI_QUEUE_REQUEST
+        BRW     DP_VCI_PORTMGMT_RETURN
+
+DP_VCI_CHANGE_PORT:
+        BITL    #<DP_PORT_M_STARTING!DP_PORT_M_STOPPING>,-
+                UCB_L_DP_PORT_FLAGS(R5)
+        BEQL    39$
+        BRW     DP_VCI_PORTMGMT_ACTIVE
+39$:
+        BBS     #DP_PORT_V_STARTED,UCB_L_DP_PORT_FLAGS(R5),40$
+        BRW     DP_VCI_PORTMGMT_INACTIVE
+40$:    TSTL    VCRP$L_LAN_P2BUFF_SIZE(R3)
+        BNEQ    401$
+        BRW     42$
+401$:
+        CMPL    VCRP$L_LAN_P2BUFF_SIZE(R3),#DP_NMA_SET_MAX
+        BLEQU   41$
+        BRW     DP_VCI_PORTMGMT_IVBUFLEN
+41$:    CMPL    VCRP$L_LAN_P2BUFF_SIZE(R3),#2
+        BGEQU   43$
+        BRW     DP_VCI_PORTMGMT_BADPARAM
+43$:
+        MOVL    VCRP$A_LAN_P2BUFF(R3),R6
+        BNEQ    44$
+        BRW     DP_VCI_PORTMGMT_BADPARAM
+44$:
+        MOVL    (R6),R6
+        BNEQ    45$
+        BRW     DP_VCI_PORTMGMT_BADPARAM
+45$:
+        MOVZWL  (R6),R1
+        MOVZWL  #SS$_BADPARAM,R0
+        BRW     DP_VCI_PORTMGMT_COMPLETE
+42$:    MOVZWL  #SS$_NORMAL,R0
+        CLRL    R1
+        BRW     DP_VCI_PORTMGMT_COMPLETE
+
+DP_VCI_PORTMGMT_ILLIOFUNC:
+        MOVZWL  #SS$_ILLIOFUNC,R0
+        CLRL    R1
+        BRW     DP_VCI_PORTMGMT_COMPLETE
+DP_VCI_PORTMGMT_BADPARAM:
+        MOVZWL  #SS$_BADPARAM,R0
+        CLRL    R1
+        BRW     DP_VCI_PORTMGMT_COMPLETE
+DP_VCI_PORTMGMT_IVBUFLEN:
+        MOVZWL  #SS$_IVBUFLEN,R0
+        CLRL    R1
+        BRW     DP_VCI_PORTMGMT_COMPLETE
+DP_VCI_PORTMGMT_ACTIVE:
+        MOVZWL  #SS$_DEVACTIVE,R0
+        CLRL    R1
+        BRW     DP_VCI_PORTMGMT_COMPLETE
+DP_VCI_PORTMGMT_INACTIVE:
+        MOVZWL  #SS$_DEVINACT,R0
+        CLRL    R1
+        BRW     DP_VCI_PORTMGMT_COMPLETE
+DP_VCI_PORTMGMT_NOSUCHDEV:
+        MOVZWL  #SS$_NOSUCHDEV,R0
+        CLRL    R1
+        BRW     DP_VCI_PORTMGMT_COMPLETE
+DP_VCI_PORTMGMT_OFFLINE:
+        MOVZWL  #SS$_DEVOFFLINE,R0
+        CLRL    R1
+
+; Store the two-longword status before returning ownership of an immediately
+; rejected request.  Asynchronous ENABLE/DISABLE events are emitted by the
+; worker only after its management completion callback.
+
+DP_VCI_PORTMGMT_COMPLETE:
+        TSTL    R5
+        BNEQ    1$
+        BRW     2$
+1$:     MOVL    UCB_L_DP_CONTROLLER(R5),R2
+        BEQL    2$
+        MOVL    R0,DPCB_L_VCI_MGMT_STATUS(R2)
+        MOVL    R1,DPCB_L_VCI_MGMT_STATUS2(R2)
+; A later TCP/IP cleanup DISABLE can overwrite the ordinary diagnostic slot.
+; Preserve the first synchronous completion so the original ENABLE rejection
+; remains visible after the complete define/rollback sequence.
+        TSTL    DPCB_L_VCI_FIRST_STATUS(R2)
+        BNEQ    2$
+        MOVL    VCRP$L_FUNCTION(R3),DPCB_L_VCI_FIRST_FUNCTION(R2)
+        MOVL    R0,DPCB_L_VCI_FIRST_STATUS(R2)
+        MOVL    R1,DPCB_L_VCI_FIRST_STATUS2(R2)
+2$:
+        MOVQ    R0,VCRP$Q_REQUEST_STATUS(R3)
+        PUSHL   R3
+        JSB     @VCIB$A_PORTMGMT_COMPLETE(R4)
+        POPL    R3
+        BRW     DP_VCI_PORTMGMT_RETURN
+
+DP_VCI_PORTMGMT_RETURN:
+        POPR    #^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+        RSB
+
+; Build the static Ethernet-II header exactly as the resident CSMACD routine
+; does for FMT=ETH and PAD=OFF.  R0 initially points just beyond the header;
+; destination address remains dynamic and is inserted by TRANSMIT_FRAME.
+; Only R0 and R3 may be destroyed by this public callback.
+
+DP_VCI_BUILD_HDR:
+        PUSHL   R5
+        SUBL    #DP_ETH_HEADER,R0
+        MOVL    VCIB$A_LAN_PHA(R4),R5
+        MOVL    (R5),6(R0)
+        MOVW    4(R5),10(R0)
+        MOVL    VCIB$A_LAN_UCB(R4),R5
+        MOVW    UCB_W_DP_PORT_PTY(R5),12(R0)
+        MOVZBL  #DP_ETH_HEADER,R3
+        POPL    R5
+        RSB
+
+; TRANSMIT_FRAME receives a complete Ethernet frame whose static header was
+; normally produced by DP_VCI_BUILD_HDR.  The destination address is still a
+; per-request field in VCRP$Q_LAN_T_DEST.  Tag the owned request temporarily
+; so the serialized worker copies the complete frame instead of treating it
+; as payload; the worker clears the private tag before upper completion.
+; Only R0 and R3 may be destroyed by this public callback.
+
+DP_VCI_TRANSMIT_FRAME:
+        PUSHR   #^M<R1,R2,R4,R5,R6,R7,R8,R9,R10,R11>
+        INCL    DP_VCI_TX_RAW_ENTRY_COUNT
+        INCL    DP_VCI_TX_RAW_FRAME_COUNT
+        MOVL    R3,DP_VCI_TX_RAW_VCRP
+        MOVL    R4,DP_VCI_TX_RAW_VCIB
+        MOVL    (R3),DP_VCI_TX_RAW0
+        MOVL    4(R3),DP_VCI_TX_RAW1
+        MOVL    8(R3),DP_VCI_TX_RAW2
+        MOVL    12(R3),DP_VCI_TX_RAW3
+        MOVZWL  VCRP$W_SIZE(R3),R0
+        MOVL    R0,DP_VCI_TX_RAW_SIZE
+        MOVZBL  VCRP$B_TYPE(R3),R0
+        MOVL    R0,DP_VCI_TX_RAW_TYPE
+        MOVL    VCRP$L_FUNCTION(R3),DP_VCI_TX_RAW_FUNCTION
+        CLRL    R6
+        TSTL    VCIB$A_TRANSMIT_COMPLETE(R4)
+        BNEQ    10$
+        BRW     DP_VCI_TRANSMIT_FRAME_RETURN
+; TCP/IP Services V5.1 uses a legacy zero dynamic-header size in CREATE_PORT
+; and PORTMGMT VCRPs.  Stock CSMACD trusts transmit VCRPs without inspecting
+; this field.  Accept zero as unspecified here too, while continuing to reject
+; an explicit nonzero short header.
+10$:    TSTW    VCRP$W_SIZE(R3)
+        BEQL    11$
+        CMPW    VCRP$W_SIZE(R3),#VCRP$K_FIXED_LENGTH
+        BGEQU   11$
+        BRW     DP_VCI_TRANSMIT_FRAME_BADPARAM
+11$:    CMPB    VCRP$B_TYPE(R3),#DYN$C_VCRP
+        BEQL    12$
+        BRW     DP_VCI_TRANSMIT_FRAME_BADPARAM
+12$:    CMPL    VCRP$L_FUNCTION(R3),#VCRP$K_FC_TRANSMIT
+        BEQL    13$
+        BRW     DP_VCI_TRANSMIT_FRAME_ILLIOFUNC
+13$:    MOVL    VCIB$A_LAN_UCB(R4),R5
+        BNEQ    14$
+        BRW     DP_VCI_TRANSMIT_FRAME_NOSUCHDEV
+14$:    CMPL    UCB_L_DP_VCIB(R5),R4
+        BEQL    15$
+        BRW     DP_VCI_TRANSMIT_FRAME_NOSUCHDEV
+15$:    MOVL    UCB_L_DP_CONTROLLER(R5),R6
+        BNEQ    16$
+        BRW     DP_VCI_TRANSMIT_FRAME_OFFLINE
+16$:    CMPL    DPCB_L_MAGIC(R6),#DP_CONTROLLER_MAGIC
+        BEQL    165$
+        CLRL    R6
+        BRW     DP_VCI_TRANSMIT_FRAME_OFFLINE
+165$:   INCL    DPCB_L_VCI_TX_ENTRY_COUNT(R6)
+        MOVL    VCRP$L_BCNT(R3),DPCB_L_VCI_TX_LAST_BCNT(R6)
+        MOVL    VCRP$L_TOTAL_PDU_SIZE(R3),DPCB_L_VCI_TX_LAST_TOTAL(R6)
+17$:    BBS     #DP_CONTROLLER_V_READY,DPCB_L_FLAGS(R6),18$
+        BRW     DP_VCI_TRANSMIT_FRAME_OFFLINE
+18$:    BITL    #<DP_PORT_M_STARTING!DP_PORT_M_STOPPING>,-
+                UCB_L_DP_PORT_FLAGS(R5)
+        BEQL    19$
+        BRW     DP_VCI_TRANSMIT_FRAME_ACTIVE
+19$:    BBS     #DP_PORT_V_STARTED,UCB_L_DP_PORT_FLAGS(R5),20$
+        BRW     DP_VCI_TRANSMIT_FRAME_INACTIVE
+20$:    CMPL    VCRP$L_BOFF(R3),#VCRP$T_DATA
+        BGEQU   22$
+        BRW     DP_VCI_TRANSMIT_FRAME_BADPARAM
+22$:    MOVL    VCRP$L_BCNT(R3),R7
+        CMPL    R7,#DP_ETH_HEADER
+        BGEQU   23$
+        BRW     DP_VCI_TRANSMIT_FRAME_IVBUFLEN
+23$:    MOVL    VCRP$L_TOTAL_PDU_SIZE(R3),R11
+        CMPL    R11,#DP_ETH_HEADER
+        BGEQU   231$
+        BRW     DP_VCI_TRANSMIT_FRAME_IVBUFLEN
+231$:   CMPL    R11,#DP_TX_MAX
+        BLEQU   24$
+        BRW     DP_VCI_TRANSMIT_FRAME_IVBUFLEN
+24$:    MOVZWL  UCB_W_DP_PORT_BUS(R5),R8
+        ADDL    #DP_ETH_HEADER,R8
+        CMPL    R11,R8
+        BLEQU   25$
+        BRW     DP_VCI_TRANSMIT_FRAME_IVBUFLEN
+25$:    CMPL    R7,R11
+        BLEQU   26$
+        BRW     DP_VCI_TRANSMIT_FRAME_BADPARAM
+26$:    ADDL3   VCRP$L_BOFF(R3),R7,R8
+        BCC     27$
+        BRW     DP_VCI_TRANSMIT_FRAME_BADPARAM
+27$:    MOVZWL  VCRP$W_SIZE(R3),R9
+        TSTW    R9
+        BEQL    28$
+        CMPL    R8,R9
+        BLEQU   28$
+        BRW     DP_VCI_TRANSMIT_FRAME_BADPARAM
+28$:    MOVL    VCRP$A_DCB_LINK(R3),R10
+        BNEQ    281$
+        CMPL    R7,R11
+        BNEQ    280$
+        BRW     29$
+280$:
+        BRW     DP_VCI_TRANSMIT_FRAME_BADPARAM
+
+; VAX V7.3 CSMACD promises at most one additional DCBE.  Direct system
+; virtual addresses are coalesced by the worker.  A page-table descriptor is
+; recognized and rejected without dereferencing it until this driver owns a
+; preallocated system-PTE mapping window equivalent to LAN$SETUP_PTE's LSB.
+
+281$:   INCL    DPCB_L_VCI_CHAIN_SEEN(R6)
+        CLRL    DPCB_L_VCI_CHAIN_MODE(R6)
+        MOVL    DCBE$L_BCNT(R10),R8
+        MOVL    R8,DPCB_L_VCI_CHAIN_BCNT(R6)
+        MOVZWL  #SS$_BADPARAM,R0
+        MOVL    R0,DPCB_L_VCI_CHAIN_STATUS(R6)
+        TSTL    DCBE$A_DCB_LINK(R10)
+        BEQL    282$
+        MOVL    #DP_VCI_CHAIN_MULTIPLE,DPCB_L_VCI_CHAIN_MODE(R6)
+        BRW     DP_VCI_FRAME_UNSUPPORTED
+282$:   TSTL    R8
+        BEQL    284$
+        TSTL    DCBE$L_BUFFER_ADDRESS(R10)
+        BNEQ    283$
+        MOVL    #DP_VCI_CHAIN_SVAPTE,DPCB_L_VCI_CHAIN_MODE(R6)
+        BRW     DP_VCI_FRAME_UNSUPPORTED
+283$:   MOVL    #DP_VCI_CHAIN_SVA,DPCB_L_VCI_CHAIN_MODE(R6)
+284$:   ADDL3   R7,R8,R9
+        BCC     285$
+        BRW     DP_VCI_TRANSMIT_FRAME_BADPARAM
+285$:   CMPL    R9,R11
+        BEQL    286$
+        BRW     DP_VCI_TRANSMIT_FRAME_BADPARAM
+286$:   MOVZWL  #SS$_NORMAL,R0
+        MOVL    R0,DPCB_L_VCI_CHAIN_STATUS(R6)
+
+29$:    INCL    DPCB_L_VCI_TX_QUEUE_COUNT(R6)
+        MOVL    R5,VCRP$A_LAN_UCB(R3)
+        BISL    #DP_VCI_M_FRAME,VCRP$L_FUNCTION(R3)
+        INCL    VCIB$L_LAN_OOCNT(R4)
+        BSBW    DP_VCI_QUEUE_REQUEST
+        BRW     DP_VCI_TRANSMIT_FRAME_RETURN
+
+DP_VCI_TRANSMIT_FRAME_ILLIOFUNC:
+        MOVZWL  #SS$_ILLIOFUNC,R0
+        BRW     DP_VCI_TRANSMIT_FRAME_COMPLETE
+DP_VCI_TRANSMIT_FRAME_BADPARAM:
+        MOVZWL  #SS$_BADPARAM,R0
+        BRW     DP_VCI_TRANSMIT_FRAME_COMPLETE
+DP_VCI_TRANSMIT_FRAME_IVBUFLEN:
+        MOVZWL  #SS$_IVBUFLEN,R0
+        BRW     DP_VCI_TRANSMIT_FRAME_COMPLETE
+DP_VCI_TRANSMIT_FRAME_ACTIVE:
+        MOVZWL  #SS$_DEVACTIVE,R0
+        BRW     DP_VCI_TRANSMIT_FRAME_COMPLETE
+DP_VCI_TRANSMIT_FRAME_INACTIVE:
+        MOVZWL  #SS$_DEVINACT,R0
+        BRW     DP_VCI_TRANSMIT_FRAME_COMPLETE
+DP_VCI_TRANSMIT_FRAME_NOSUCHDEV:
+        MOVZWL  #SS$_NOSUCHDEV,R0
+        BRW     DP_VCI_TRANSMIT_FRAME_COMPLETE
+DP_VCI_TRANSMIT_FRAME_OFFLINE:
+        MOVZWL  #SS$_DEVOFFLINE,R0
+        BRW     DP_VCI_TRANSMIT_FRAME_COMPLETE
+DP_VCI_FRAME_UNSUPPORTED:
+        MOVZWL  #SS$_UNSUPPORTED,R0
+        MOVL    R0,DPCB_L_VCI_CHAIN_STATUS(R6)
+DP_VCI_TRANSMIT_FRAME_COMPLETE:
+        CLRL    R1
+        TSTL    R6
+        BEQL    1$
+        INCL    DPCB_L_VCI_TX_COMPLETE_COUNT(R6)
+        MOVL    R0,DPCB_L_VCI_TX_STATUS(R6)
+        MOVL    R1,DPCB_L_VCI_TX_STATUS2(R6)
+1$:
+        MOVQ    R0,VCRP$Q_REQUEST_STATUS(R3)
+        JSB     @VCIB$A_TRANSMIT_COMPLETE(R4)
+DP_VCI_TRANSMIT_FRAME_RETURN:
+        POPR    #^M<R1,R2,R4,R5,R6,R7,R8,R9,R10,R11>
+        RSB
+
+; VCI transmit receives user payload in the VCRP and builds the Ethernet
+; header in a controller-owned staging buffer.  One direct-SVA DCBE is
+; accepted and coalesced; SVAPTE or multiple-DCBE requests fail closed.
+; Only R0 and R3 may be destroyed by this public callback.
+
+DP_VCI_TRANSMIT:
+        PUSHR   #^M<R1,R2,R4,R5,R6,R7,R8,R9,R10,R11>
+        INCL    DP_VCI_TX_RAW_ENTRY_COUNT
+        INCL    DP_VCI_TX_RAW_INIT_COUNT
+        MOVL    R3,DP_VCI_TX_RAW_VCRP
+        MOVL    R4,DP_VCI_TX_RAW_VCIB
+        MOVL    (R3),DP_VCI_TX_RAW0
+        MOVL    4(R3),DP_VCI_TX_RAW1
+        MOVL    8(R3),DP_VCI_TX_RAW2
+        MOVL    12(R3),DP_VCI_TX_RAW3
+        MOVZWL  VCRP$W_SIZE(R3),R0
+        MOVL    R0,DP_VCI_TX_RAW_SIZE
+        MOVZBL  VCRP$B_TYPE(R3),R0
+        MOVL    R0,DP_VCI_TX_RAW_TYPE
+        MOVL    VCRP$L_FUNCTION(R3),DP_VCI_TX_RAW_FUNCTION
+        CLRL    R6
+        TSTL    VCIB$A_TRANSMIT_COMPLETE(R4)
+        BNEQ    10$
+        BRW     DP_VCI_TRANSMIT_RETURN
+10$:    TSTW    VCRP$W_SIZE(R3)
+        BEQL    11$
+        CMPW    VCRP$W_SIZE(R3),#VCRP$K_FIXED_LENGTH
+        BGEQU   11$
+        BRW     DP_VCI_TRANSMIT_BADPARAM
+11$:    CMPB    VCRP$B_TYPE(R3),#DYN$C_VCRP
+        BEQL    12$
+        BRW     DP_VCI_TRANSMIT_BADPARAM
+12$:    CMPL    VCRP$L_FUNCTION(R3),#VCRP$K_FC_TRANSMIT
+        BEQL    13$
+        BRW     DP_VCI_TRANSMIT_ILLIOFUNC
+13$:    MOVL    VCIB$A_LAN_UCB(R4),R5
+        BNEQ    14$
+        BRW     DP_VCI_TRANSMIT_NOSUCHDEV
+14$:    CMPL    UCB_L_DP_VCIB(R5),R4
+        BEQL    15$
+        BRW     DP_VCI_TRANSMIT_NOSUCHDEV
+15$:    MOVL    UCB_L_DP_CONTROLLER(R5),R6
+        BNEQ    16$
+        BRW     DP_VCI_TRANSMIT_OFFLINE
+16$:    CMPL    DPCB_L_MAGIC(R6),#DP_CONTROLLER_MAGIC
+        BEQL    165$
+        CLRL    R6
+        BRW     DP_VCI_TRANSMIT_OFFLINE
+165$:   INCL    DPCB_L_VCI_TX_ENTRY_COUNT(R6)
+        MOVL    VCRP$L_BCNT(R3),DPCB_L_VCI_TX_LAST_BCNT(R6)
+        MOVL    VCRP$L_TOTAL_PDU_SIZE(R3),DPCB_L_VCI_TX_LAST_TOTAL(R6)
+17$:    BBS     #DP_CONTROLLER_V_READY,DPCB_L_FLAGS(R6),18$
+        BRW     DP_VCI_TRANSMIT_OFFLINE
+18$:    BITL    #<DP_PORT_M_STARTING!DP_PORT_M_STOPPING>,-
+                UCB_L_DP_PORT_FLAGS(R5)
+        BEQL    19$
+        BRW     DP_VCI_TRANSMIT_ACTIVE
+19$:    BBS     #DP_PORT_V_STARTED,UCB_L_DP_PORT_FLAGS(R5),20$
+        BRW     DP_VCI_TRANSMIT_INACTIVE
+
+; The embedded payload must have the documented header backfill room even
+; though this driver copies rather than mutates it.  Checked addition prevents
+; a wrapped BOFF+BCNT from passing the VCRP size test.
+
+20$:    CMPL    VCRP$L_BOFF(R3),#<VCRP$T_DATA+DP_ETH_HEADER>
+        BGEQU   22$
+        BRW     DP_VCI_TRANSMIT_BADPARAM
+22$:    MOVL    VCRP$L_BCNT(R3),R7
+        CMPL    R7,#1500
+        BLEQU   23$
+        BRW     DP_VCI_TRANSMIT_IVBUFLEN
+23$:    MOVL    VCRP$L_TOTAL_PDU_SIZE(R3),R11
+        CMPL    R11,#1500
+        BLEQU   231$
+        BRW     DP_VCI_TRANSMIT_IVBUFLEN
+231$:   MOVZWL  UCB_W_DP_PORT_BUS(R5),R8
+        CMPL    R11,R8
+        BLEQU   24$
+        BRW     DP_VCI_TRANSMIT_IVBUFLEN
+24$:    CMPL    R7,R11
+        BLEQU   25$
+        BRW     DP_VCI_TRANSMIT_BADPARAM
+25$:    ADDL3   VCRP$L_BOFF(R3),R7,R8
+        BCC     27$
+        BRW     DP_VCI_TRANSMIT_BADPARAM
+27$:
+        MOVZWL  VCRP$W_SIZE(R3),R9
+        TSTW    R9
+        BEQL    26$
+        CMPL    R8,R9
+        BLEQU   26$
+        BRW     DP_VCI_TRANSMIT_BADPARAM
+26$:    MOVL    VCRP$A_DCB_LINK(R3),R10
+        BNEQ    261$
+        CMPL    R7,R11
+        BNEQ    260$
+        BRW     29$
+260$:
+        BRW     DP_VCI_TRANSMIT_BADPARAM
+261$:   INCL    DPCB_L_VCI_CHAIN_SEEN(R6)
+        CLRL    DPCB_L_VCI_CHAIN_MODE(R6)
+        MOVL    DCBE$L_BCNT(R10),R8
+        MOVL    R8,DPCB_L_VCI_CHAIN_BCNT(R6)
+        MOVZWL  #SS$_BADPARAM,R0
+        MOVL    R0,DPCB_L_VCI_CHAIN_STATUS(R6)
+        TSTL    DCBE$A_DCB_LINK(R10)
+        BEQL    262$
+        MOVL    #DP_VCI_CHAIN_MULTIPLE,DPCB_L_VCI_CHAIN_MODE(R6)
+        BRW     DP_VCI_TRANSMIT_UNSUPPORTED
+262$:   TSTL    R8
+        BEQL    264$
+        TSTL    DCBE$L_BUFFER_ADDRESS(R10)
+        BNEQ    263$
+        MOVL    #DP_VCI_CHAIN_SVAPTE,DPCB_L_VCI_CHAIN_MODE(R6)
+        BRW     DP_VCI_TRANSMIT_UNSUPPORTED
+263$:   MOVL    #DP_VCI_CHAIN_SVA,DPCB_L_VCI_CHAIN_MODE(R6)
+264$:   ADDL3   R7,R8,R9
+        BCC     265$
+        BRW     DP_VCI_TRANSMIT_BADPARAM
+265$:   CMPL    R9,R11
+        BEQL    266$
+        BRW     DP_VCI_TRANSMIT_BADPARAM
+266$:   MOVZWL  #SS$_NORMAL,R0
+        MOVL    R0,DPCB_L_VCI_CHAIN_STATUS(R6)
+
+29$:    INCL    DPCB_L_VCI_TX_QUEUE_COUNT(R6)
+        MOVL    R5,VCRP$A_LAN_UCB(R3)
+        INCL    VCIB$L_LAN_OOCNT(R4)
+        BSBW    DP_VCI_QUEUE_REQUEST
+        BRW     DP_VCI_TRANSMIT_RETURN
+
+DP_VCI_TRANSMIT_ILLIOFUNC:
+        MOVZWL  #SS$_ILLIOFUNC,R0
+        BRW     DP_VCI_TRANSMIT_COMPLETE
+DP_VCI_TRANSMIT_BADPARAM:
+        MOVZWL  #SS$_BADPARAM,R0
+        BRW     DP_VCI_TRANSMIT_COMPLETE
+DP_VCI_TRANSMIT_IVBUFLEN:
+        MOVZWL  #SS$_IVBUFLEN,R0
+        BRW     DP_VCI_TRANSMIT_COMPLETE
+DP_VCI_TRANSMIT_ACTIVE:
+        MOVZWL  #SS$_DEVACTIVE,R0
+        BRW     DP_VCI_TRANSMIT_COMPLETE
+DP_VCI_TRANSMIT_INACTIVE:
+        MOVZWL  #SS$_DEVINACT,R0
+        BRW     DP_VCI_TRANSMIT_COMPLETE
+DP_VCI_TRANSMIT_NOSUCHDEV:
+        MOVZWL  #SS$_NOSUCHDEV,R0
+        BRW     DP_VCI_TRANSMIT_COMPLETE
+DP_VCI_TRANSMIT_OFFLINE:
+        MOVZWL  #SS$_DEVOFFLINE,R0
+        BRW     DP_VCI_TRANSMIT_COMPLETE
+DP_VCI_TRANSMIT_UNSUPPORTED:
+        MOVZWL  #SS$_UNSUPPORTED,R0
+        MOVL    R0,DPCB_L_VCI_CHAIN_STATUS(R6)
+DP_VCI_TRANSMIT_COMPLETE:
+        CLRL    R1
+        TSTL    R6
+        BEQL    1$
+        INCL    DPCB_L_VCI_TX_COMPLETE_COUNT(R6)
+        MOVL    R0,DPCB_L_VCI_TX_STATUS(R6)
+        MOVL    R1,DPCB_L_VCI_TX_STATUS2(R6)
+1$:
+        MOVQ    R0,VCRP$Q_REQUEST_STATUS(R3)
+        JSB     @VCIB$A_TRANSMIT_COMPLETE(R4)
+DP_VCI_TRANSMIT_RETURN:
+        POPR    #^M<R1,R2,R4,R5,R6,R7,R8,R9,R10,R11>
+        RSB
+
+; Queue a typed VCRP without ever overlaying it as an IRP.  R6 is the shared
+; DPCB, R3 the VCRP.  If the controller was idle, its embedded FKB becomes the
+; owner; otherwise the current IRP or VCRP owner will hand it off on release.
+
+DP_VCI_QUEUE_REQUEST:
+        INSQUE  (R3),@DPCB_L_VCIQ_BL(R6)
+        BBSS    #DP_CONTROLLER_V_BUSY,DPCB_L_FLAGS(R6),20$
+        MOVL    R6,R4
+        MOVAL   DPCB_B_WAIT_FKB(R6),R5
+        BSBW    DP_SCHEDULE_CONTROLLER_FORK
+20$:    RSB
+.ENDC
+
+; ----- FDT preprocessing -------------------------------------------------
+
+; Prepare an Ethernet receive in the original VAX LAN-driver buffered-I/O
+; form.  P5 is represented by an RHDR in IRP$L_DIAGBUF.  P1 is checked by
+; EXE$READCHK, but the SCSI port never maps that user address: a BUFIO block
+; receives the raw DaynaPORT reply in S0 space and IOC$IOPOST later copies
+; only the decoded payload to P1.  The offsets below are the ones used by the
+; V4.1 XQDRIVER RCV_FDT and by V7.3 IOCIOPOST.
+
+DP_READ_FDT:
+        CLRW    IRP$W_BOFF(R3)
+        MOVL    P5(AP),R7
+        BEQL    DP_READ_FDT_P1
+        IFNOWRT #DP_RHDR_C_DATA,(R7),10$
+        BRB     11$
+10$:    BRW     DP_READ_FDT_ACCVIO
+11$:    BBC     #IRP$V_DIAGBUF,IRP$W_STS(R3),12$
+        BRW     DP_READ_FDT_BADPARAM
+12$:
+        MOVZBL  #DP_RHDR_C_LENGTH,R1
+        PUSHL   R3
+        JSB     G^EXE$ALLOCBUF
+        POPL    R3
+        BLBC    R0,DP_READ_FDT_ABORT
+        MOVL    R2,IRP$L_DIAGBUF(R3)
+        BISW    #IRP$M_DIAGBUF,IRP$W_STS(R3)
+        MOVAB   DP_RHDR_T_DATA(R2),DP_RHDR_L_DATA(R2)
+        MOVL    R7,DP_RHDR_L_BUFFER(R2)
+        MOVW    R1,DP_RHDR_W_SIZE(R2)
+        MOVB    #DYN$C_BUFIO,DP_RHDR_B_TYPE(R2)
+        CLRB    DP_RHDR_B_FLAGS(R2)
+; Make an empty READ|NOW return a deterministic empty P5 header.  Clear the
+; exact fourteen-byte Ethernet header instead of depending on zero-length
+; MOVC5 fill behavior in FDT context.
+        CLRQ    DP_RHDR_T_DATA(R2)
+        CLRL    DP_RHDR_T_DATA+8(R2)
+        CLRW    DP_RHDR_T_DATA+12(R2)
+
+DP_READ_FDT_P1:
+        MOVZWL  P2(AP),R1
+        BEQL    DP_READ_FDT_BADPARAM
+        MOVL    P1(AP),R0
+        BEQL    DP_READ_FDT_BADPARAM
+        JSB     G^EXE$READCHK
+
+; Allocate enough buffered-I/O storage for the complete six-byte DaynaPORT
+; envelope, maximum Ethernet frame, and FCS.  Keep P1 in the standard second
+; BUFIO longword; IOC$IOPOST consumes it in process context.
+
+        MOVL    P1(AP),R7
+        MOVL    #DP_RX_BUFFER_LENGTH,R1
+        PUSHL   R3
+        JSB     G^EXE$ALLOCBUF
+        POPL    R3
+        BLBC    R0,DP_READ_FDT_ABORT
+        MOVL    R2,IRP$L_SVAPTE(R3)
+        MOVAB   DP_RX_RAW_OFFSET(R2),DP_BUFIO_L_DATA(R2)
+        MOVL    R7,DP_BUFIO_L_BUFFER(R2)
+        MOVW    R1,DP_BUFIO_W_SIZE(R2)
+        MOVB    #DYN$C_BUFIO,DP_BUFIO_B_TYPE(R2)
+        CLRB    DP_BUFIO_B_FLAGS(R2)
+; EXE$READCHK marks the device-to-host direction but does not guarantee the
+; buffered-I/O dispatch bit for this DC$_MISC driver.  IOC$IOPOST must see
+; BUFIO or it interprets IRP$L_SVAPTE as a PTE array and tries to unlock it.
+        BISW    #<IRP$M_BUFIO!IRP$M_CHAINED>,IRP$W_STS(R3)
+        JMP     G^EXE$QIODRVPKT
+
+DP_READ_FDT_BADPARAM:
+        MOVZWL  #SS$_BADPARAM,R0
+        BRB     DP_READ_FDT_ABORT
+DP_READ_FDT_ACCVIO:
+        MOVZWL  #SS$_ACCVIO,R0
+DP_READ_FDT_ABORT:
+        CLRL    R1
+        JMP     G^EXE$ABORTIO
+
+; EXE$WRITELOCKR checks read access to the user's host-to-device buffer,
+; locks its pages, and fills the IRP mapping fields.  On failure it returns
+; here through a coroutine call; no private FDT resources need releasing.
+
+DP_WRITE_FDT:
+        TSTL    P1(AP)
+        BNEQ    10$
+        BRW     DP_BADPARAM
+10$:
+        TSTL    P2(AP)
+        BNEQ    20$
+        BRW     DP_BADPARAM
+20$:
+        MOVL    P1(AP),R0
+        MOVL    P2(AP),R1
+        JSB     G^EXE$WRITELOCKR
+        BLBC    R0,DP_WRITE_LOCK_FAILED
+        JMP     G^EXE$QIODRVPKT
+
+DP_WRITE_LOCK_FAILED:
+        RSB
+
+; SETMODE accepts the initial exclusive Ethernet subset.  EXE$PROBER_DSC
+; validates the optional descriptor and returns its length in R1 and address
+; in R2.  Copying the bytes to nonpaged pool closes the user-buffer TOCTOU
+; window before the transactional parser runs under the shared fork lock.
+
+DP_SETMODE_FDT:
+        PUSHR   #^M<R6,R7,R8>
+        CLRL    IRP$L_SVAPTE(R3)
+        CLRL    IRP$L_BCNT(R3)
+        MOVZWL  IRP$W_FUNC(R3),R0
+        BBC     #IO$V_CTRL,R0,DP_SET_BAD_FUNCTION
+        BICL3   #IO$M_FCODE,R0,R2
+        BICL    #<<1@IO$V_CTRL>!<1@IO$V_STARTUP>!<1@IO$V_SHUTDOWN>>,R2
+        BNEQ    DP_SET_BAD_FUNCTION
+        EXTZV   #IO$V_STARTUP,#1,R0,R1
+        EXTZV   #IO$V_SHUTDOWN,#1,R0,R2
+        ADDL    R2,R1
+        CMPL    R1,#1
+        BLEQU   DP_SET_GET_P2
+
+DP_SET_BAD_FUNCTION:
+        MOVZWL  #SS$_BADPARAM,R0
+        CLRL    R1
+        BRW     DP_SET_ABORT_DIRECT
+
+DP_SET_GET_P2:
+.IF DEFINED DP$VCI_FRONTEND
+; The private hook transition is the only no-start/no-stop SETMODE request
+; forwarded to STARTIO.  P1 is a value (not an address), P2 must be absent,
+; and CMKRNL is checked while the caller's process context is still current.
+        TSTL    R1
+        BEQL    1$
+        BRW     DP_SET_NORMAL_P2
+1$:     EXTZV   #IRP$V_FCODE,#IRP$S_FCODE,R0,R2
+        CMPL    R2,#IO$_SETMODE
+        BEQL    2$
+        BRW     DP_SET_NORMAL_P2
+2$:     CMPL    P1(AP),#DP_VCI_CTL_INSTALL
+        BEQL    3$
+        CMPL    P1(AP),#DP_VCI_CTL_REMOVE
+        BEQL    3$
+        BRW     DP_SET_NORMAL_P2
+3$:     TSTL    P2(AP)
+        BEQL    4$
+        BRW     DP_SET_BAD_FUNCTION
+4$:     IFNPRIV CMKRNL,5$
+        MOVL    P1(AP),IRP_L_DP_VCI_CONTROL(R3)
+        POPR    #^M<R6,R7,R8>
+        JMP     G^EXE$QIODRVPKT
+5$:     MOVZWL  #SS$_NOPRIV,R0
+        CLRL    R1
+        BRW     DP_SET_ABORT_DIRECT
+DP_SET_NORMAL_P2:
+.ENDC
+        MOVL    P2(AP),R1
+        BNEQ    10$
+        BRW     DP_SET_LOCK
+10$:
+        PUSHL   R3
+        JSB     G^EXE$PROBER_DSC
+        POPL    R3
+        BLBS    R0,DP_SET_DESCRIPTOR_OK
+        CLRL    R1
+        BRW     DP_SET_ABORT_DIRECT
+
+DP_SET_DESCRIPTOR_OK:
+        CMPL    R1,#DP_NMA_SET_MAX
+        BLEQU   DP_SET_LENGTH_OK
+        MOVZWL  #SS$_IVBUFLEN,R0
+        CLRL    R1
+        BRW     DP_SET_ABORT_DIRECT
+
+DP_SET_LENGTH_OK:
+        TSTL    R1
+        BNEQ    10$
+        BRW     DP_SET_LOCK
+10$:
+        MOVL    R1,IRP$L_BCNT(R3)
+        MOVL    R2,R8
+        BSBW    DP_ALLOC_POOL
+        BLBS    R0,DP_SET_COPY_P2
+        CLRL    R1
+        BRW     DP_SET_ABORT_DIRECT
+
+DP_SET_COPY_P2:
+        MOVL    R2,IRP$L_SVAPTE(R3)
+        PUSHR   #^M<R0,R1,R2,R3,R4,R5>
+        MOVC3   IRP$L_BCNT(R3),(R8),(R2)
+        POPR    #^M<R0,R1,R2,R3,R4,R5>
+
+DP_SET_LOCK:
+        FORKLOCK UCB$B_FLCK(R5),SAVIPL=-(SP),PRESERVE=YES
+
+; Attributes cannot be changed once a start or stop has begun.  Return the
+; first complete ID as the offending parameter, without changing the UCB.
+
+        TSTL    IRP$L_BCNT(R3)
+        BEQL    DP_SET_LOAD_CANDIDATE
+        BITL    #<DP_PORT_M_STARTED!DP_PORT_M_STARTING!DP_PORT_M_STOPPING>,-
+                UCB_L_DP_PORT_FLAGS(R5)
+        BEQL    DP_SET_LOAD_CANDIDATE
+        CLRL    R1
+        CMPL    IRP$L_BCNT(R3),#2
+        BLSSU   DP_SET_ACTIVE_BAD
+        MOVL    IRP$L_SVAPTE(R3),R0
+        MOVZWL  (R0),R1
+DP_SET_ACTIVE_BAD:
+        MOVZWL  #SS$_BADPARAM,R0
+        BRW     DP_SET_UNLOCK_ERROR
+
+DP_SET_LOAD_CANDIDATE:
+; Retain a bounded snapshot of the most recent ordinary SETMODE parser
+; failure.  This is diagnostic state only: it neither relaxes the strict
+; transactional policy nor changes the IOSB returned to the caller.
+        MOVL    UCB_L_DP_CONTROLLER(R5),R2
+        MOVZWL  IRP$W_FUNC(R3),DPCB_L_SET_FUNCTION(R2)
+        MOVL    IRP$L_BCNT(R3),DPCB_L_SET_P2_SIZE(R2)
+        CLRL    DPCB_L_SET_BAD_ID(R2)
+        CLRL    DPCB_L_SET_REMAINING(R2)
+        CLRQ    DPCB_L_SET_BAD_RAW0(R2)
+        CLRL    DPCB_L_SET_STATUS(R2)
+        MOVZWL  UCB_W_DP_PORT_PTY(R5),R9
+        MOVZWL  UCB_W_DP_PORT_BUS(R5),R10
+        MOVZBL  UCB_B_DP_PORT_BFN(R5),R0
+        INSV    R0,#16,#8,R10
+        MOVZBL  UCB_B_DP_PORT_PAD(R5),R0
+        INSV    R0,#24,#8,R10
+        MOVZBL  UCB_B_DP_PORT_ACC(R5),R11
+        CLRL    R8
+        MOVL    IRP$L_SVAPTE(R3),R6
+        MOVL    IRP$L_BCNT(R3),R7
+        BSBW    DP_PARSE_SET_ATTRIBUTES
+        BLBS    R0,DP_SET_ATTRIBUTES_OK
+        BSBW    DP_RECORD_SET_FAILURE
+        BRW     DP_SET_UNLOCK_ERROR
+
+DP_SET_ATTRIBUTES_OK:
+; PTY is a startup combination requirement.  Check it before committing any
+; otherwise valid P2 fields so a failed startup is transactional as well.
+        BBC     #IO$V_STARTUP,IRP$W_FUNC(R3),DP_SET_COMMIT
+        TSTW    R9
+        BNEQ    DP_SET_COMMIT
+        MOVZWL  #SS$_BADPARAM,R0
+        MOVZWL  #NMA$C_PCLI_PTY,R1
+        BSBW    DP_RECORD_SET_FAILURE
+        BRW     DP_SET_UNLOCK_ERROR
+
+DP_SET_COMMIT:
+        MOVW    R9,UCB_W_DP_PORT_PTY(R5)
+        MOVW    R10,UCB_W_DP_PORT_BUS(R5)
+        MOVW    R10,UCB$W_DEVBUFSIZ(R5)
+        EXTZV   #16,#8,R10,R0
+        MOVB    R0,UCB_B_DP_PORT_BFN(R5)
+        EXTZV   #24,#8,R10,R0
+        MOVB    R0,UCB_B_DP_PORT_PAD(R5)
+        MOVB    R11,UCB_B_DP_PORT_ACC(R5)
+        BBC     #DP_ATTR_V_RES,R8,1$
+        MOVB    #NMA$C_LINRES_ENA,UCB_B_DP_PORT_RES(R5)
+1$:
+
+        BBC     #IO$V_SHUTDOWN,IRP$W_FUNC(R3),DP_SET_NOT_SHUTDOWN
+        BITL    #<DP_PORT_M_STARTING!DP_PORT_M_STOPPING>,-
+                UCB_L_DP_PORT_FLAGS(R5)
+        BEQL    DP_SET_SHUTDOWN_STATE_OK
+        MOVZWL  #SS$_DEVACTIVE,R0
+        CLRL    R1
+        BRW     DP_SET_UNLOCK_ERROR
+DP_SET_SHUTDOWN_STATE_OK:
+        BBS     #DP_PORT_V_STARTED,UCB_L_DP_PORT_FLAGS(R5),10$
+        BRW     DP_SET_IMMEDIATE_SUCCESS
+10$:
+        BISL    #DP_PORT_M_STOPPING,UCB_L_DP_PORT_FLAGS(R5)
+        BRW     DP_SET_UNLOCK_QUEUE
+
+DP_SET_NOT_SHUTDOWN:
+        BBS     #IO$V_STARTUP,IRP$W_FUNC(R3),20$
+        BRW     DP_SET_IMMEDIATE_SUCCESS
+20$:
+        BITL    #<DP_PORT_M_STARTED!DP_PORT_M_STARTING!DP_PORT_M_STOPPING>,-
+                UCB_L_DP_PORT_FLAGS(R5)
+        BEQL    DP_SET_MARK_STARTING
+        MOVZWL  #SS$_DEVACTIVE,R0
+        CLRL    R1
+        BRW     DP_SET_UNLOCK_ERROR
+DP_SET_MARK_STARTING:
+        BISL    #DP_PORT_M_STARTING,UCB_L_DP_PORT_FLAGS(R5)
+
+DP_SET_UNLOCK_QUEUE:
+        FORKUNLOCK UCB$B_FLCK(R5),NEWIPL=(SP)+,PRESERVE=YES
+        BSBW    DP_FREE_SET_BUFFER
+        POPR    #^M<R6,R7,R8>
+        JMP     G^EXE$QIODRVPKT
+
+DP_SET_IMMEDIATE_SUCCESS:
+        FORKUNLOCK UCB$B_FLCK(R5),NEWIPL=(SP)+,PRESERVE=YES
+        BSBW    DP_FREE_SET_BUFFER
+        MOVZWL  #SS$_NORMAL,R0
+        MOVL    UCB$L_DEVDEPEND(R5),R1
+        POPR    #^M<R6,R7,R8>
+        JMP     G^EXE$FINISHIO
+
+DP_SET_UNLOCK_ERROR:
+        FORKUNLOCK UCB$B_FLCK(R5),NEWIPL=(SP)+,PRESERVE=YES
+        BSBW    DP_FREE_SET_BUFFER
+DP_SET_ABORT_DIRECT:
+        POPR    #^M<R6,R7,R8>
+        JMP     G^EXE$ABORTIO
+
+; R0/R1 retain the status/offending ID returned to EXE$ABORTIO.  R6/R7 are
+; the parser cursor and remaining byte count.  Copy at most eight bytes so a
+; live SDA inspection can distinguish an unknown tag from a known tag with
+; an invalid value without dereferencing past the copied P2 buffer.
+
+DP_RECORD_SET_FAILURE:
+        MOVL    UCB_L_DP_CONTROLLER(R5),R2
+        BEQL    30$
+        MOVL    R0,DPCB_L_SET_STATUS(R2)
+        MOVL    R1,DPCB_L_SET_BAD_ID(R2)
+        MOVL    R7,DPCB_L_SET_REMAINING(R2)
+        CLRQ    DPCB_L_SET_BAD_RAW0(R2)
+        CMPL    R7,#4
+        BGEQU   10$
+        BRW     30$
+10$:    MOVL    (R6),DPCB_L_SET_BAD_RAW0(R2)
+        CMPL    R7,#8
+        BGEQU   20$
+        BRW     30$
+20$:    MOVL    4(R6),DPCB_L_SET_BAD_RAW1(R2)
+30$:    RSB
+
+; Free the allocation made by DP_ALLOC_POOL while preserving the IOSB status
+; pair in R0/R1.  The returned payload follows a valid DYN header and four
+; bytes of alignment padding, so recover the actual pool-block address first.
+
+DP_FREE_SET_BUFFER:
+        MOVL    IRP$L_SVAPTE(R3),R2
+        BEQL    10$
+        PUSHR   #^M<R0,R1,R3,R4,R5>
+        SUBL3   #DP_POOL_HEADER_LENGTH,R2,R0
+        JSB     G^EXE$DEANONPAGED
+        POPR    #^M<R0,R1,R3,R4,R5>
+        CLRL    IRP$L_SVAPTE(R3)
+        CLRL    IRP$L_BCNT(R3)
+10$:    RSB
+
+; R6/R7 are the copied P2 cursor/remaining length.  R8 is the seen-ID mask;
+; R9, R10 and R11 hold candidate PTY, packed BUS/BFN/PAD, and ACC values.
+
+DP_PARSE_SET_ATTRIBUTES:
+        TSTL    R7
+        BNEQ    10$
+        MOVZWL  #SS$_NORMAL,R0
+        CLRL    R1
+        RSB
+10$:    CMPL    R7,#2
+        BGEQU   11$
+        CLRL    R1
+        BRW     80$
+11$:    MOVZWL  (R6),R1
+        CMPW    R1,#NMA$C_PCLI_ACC
+        BNEQ    12$
+        BRW     20$
+12$:
+        CMPW    R1,#NMA$C_PCLI_BFN
+        BNEQ    13$
+        BRW     30$
+13$:
+        CMPW    R1,#NMA$C_PCLI_BUS
+        BNEQ    14$
+        BRW     40$
+14$:
+        CMPW    R1,#NMA$C_PCLI_FMT
+        BNEQ    15$
+        BRW     50$
+15$:
+        CMPW    R1,#NMA$C_PCLI_PAD
+        BNEQ    16$
+        BRW     60$
+16$:
+        CMPW    R1,#NMA$C_PCLI_PTY
+        BNEQ    17$
+        BRW     70$
+17$:    CMPW    R1,#NMA$C_PCLI_PRM
+        BNEQ    18$
+        BRW     76$
+18$:    CMPW    R1,#NMA$C_PCLI_MLT
+        BNEQ    19$
+        BRW     86$
+19$:    CMPW    R1,#NMA$C_PCLI_CRC
+        BNEQ    191$
+        BRW     90$
+191$:   CMPW    R1,#NMA$C_PCLI_MCA
+        BNEQ    192$
+        BRW     100$
+192$:   CMPW    R1,#NMA$C_PCLI_RES
+        BNEQ    193$
+        BRW     120$
+193$:
+        BRW     80$
+
+20$:    BITL    #DP_ATTR_M_ACC,R8
+        BEQL    21$
+        BRW     80$
+21$:    CMPL    R7,#DP_NMA_SCALAR_LENGTH
+        BGEQU   22$
+        BRW     80$
+22$:    CMPL    2(R6),#NMA$C_ACC_EXC
+        BEQL    23$
+        BRW     80$
+23$:    BISL    #DP_ATTR_M_ACC,R8
+        MOVB    #NMA$C_ACC_EXC,R11
+        BRW     75$
+
+30$:    BITL    #DP_ATTR_M_BFN,R8
+        BEQL    31$
+        BRW     80$
+31$:    CMPL    R7,#DP_NMA_SCALAR_LENGTH
+        BGEQU   32$
+        BRW     80$
+32$:    CMPL    2(R6),#DP_PORT_MAX_BFN
+        BLEQU   33$
+        BRW     80$
+33$:    BISL    #DP_ATTR_M_BFN,R8
+        INSV    2(R6),#16,#8,R10
+        BRW     75$
+
+40$:    BITL    #DP_ATTR_M_BUS,R8
+        BEQL    41$
+        BRW     80$
+41$:    CMPL    R7,#DP_NMA_SCALAR_LENGTH
+        BGEQU   42$
+        BRW     80$
+42$:    CMPL    2(R6),#DP_PORT_MAX_BUS
+        BLEQU   43$
+        BRW     80$
+43$:    BISL    #DP_ATTR_M_BUS,R8
+        MOVW    2(R6),R10
+        BRW     75$
+
+50$:    BITL    #DP_ATTR_M_FMT,R8
+        BEQL    51$
+        BRW     80$
+51$:    CMPL    R7,#DP_NMA_SCALAR_LENGTH
+        BGEQU   52$
+        BRW     80$
+52$:    CMPL    2(R6),#NMA$C_LINFM_ETH
+        BEQL    53$
+        BRW     80$
+53$:    BISL    #DP_ATTR_M_FMT,R8
+        BRW     75$
+
+60$:    BITL    #DP_ATTR_M_PAD,R8
+        BEQL    61$
+        BRW     80$
+61$:    CMPL    R7,#DP_NMA_SCALAR_LENGTH
+        BGEQU   62$
+        BRW     80$
+62$:    CMPL    2(R6),#NMA$C_STATE_ON
+        BEQL    64$
+        CMPL    2(R6),#NMA$C_STATE_OFF
+        BEQL    64$
+        BRW     80$
+64$:    BISL    #DP_ATTR_M_PAD,R8
+        INSV    2(R6),#24,#8,R10
+        BRW     75$
+
+70$:    BITL    #DP_ATTR_M_PTY,R8
+        BEQL    71$
+        BRW     80$
+71$:    CMPL    R7,#DP_NMA_SCALAR_LENGTH
+        BGEQU   72$
+        BRW     80$
+72$:    CMPL    2(R6),#^XFFFF
+        BLEQU   73$
+        BRW     80$
+73$:    MOVZBL  2(R6),R0
+        ASHL    #8,R0,R0
+        MOVZBL  3(R6),R2
+        BISL    R2,R0
+        CMPL    R0,#^X05DD
+        BGEQU   74$
+        BRW     80$
+74$:    BISL    #DP_ATTR_M_PTY,R8
+        MOVW    2(R6),R9
+        BRW     75$
+
+; TCP/IP Services includes an explicit promiscuous-mode attribute in its VCI
+; ENABLE list.  The V7.3 LAN validation contract accepts STATE_OFF for a VCI
+; client but rejects STATE_ON.  Validate and consume that harmless scalar;
+; do not advertise or enable promiscuous operation for DaynaPORT.
+
+76$:    BITL    #DP_ATTR_M_PRM,R8
+        BEQL    77$
+        BRW     80$
+77$:    CMPL    R7,#DP_NMA_SCALAR_LENGTH
+        BGEQU   78$
+        BRW     80$
+78$:    CMPL    2(R6),#NMA$C_STATE_OFF
+        BEQL    79$
+        BRW     80$
+79$:    BISL    #DP_ATTR_M_PRM,R8
+        BRW     75$
+
+; All-multicast is another standard STATE scalar.  The receive frontend does
+; not yet implement an all-multicast policy, so accept the normal disabled
+; state supplied during port creation and fail closed if an upper client asks
+; to turn it on.
+
+86$:    BITL    #DP_ATTR_M_MLT,R8
+        BEQL    87$
+        BRW     80$
+87$:    CMPL    R7,#DP_NMA_SCALAR_LENGTH
+        BGEQU   88$
+        BRW     80$
+88$:    CMPL    2(R6),#NMA$C_STATE_OFF
+        BEQL    89$
+        BRW     80$
+89$:    BISL    #DP_ATTR_M_MLT,R8
+        BRW     75$
+
+; The V7.3 LAN common layer requires CRC generation for every VCI client.
+; DaynaPORT transmit requests omit the four-byte FCS and the adapter generates
+; it, so only the enabled value describes the implemented wire contract.
+
+90$:    BITL    #DP_ATTR_M_CRC,R8
+        BEQL    91$
+        BRW     80$
+91$:    CMPL    R7,#DP_NMA_SCALAR_LENGTH
+        BGEQU   92$
+        BRW     80$
+92$:    CMPL    2(R6),#NMA$C_STATE_ON
+        BEQL    93$
+        BRW     80$
+93$:    BISL    #DP_ATTR_M_CRC,R8
+        BRW     75$
+
+; MCA is a string parameter: a two-byte modifier followed by six-byte LAN
+; addresses.  TCP/IP V5.1 installs the broadcast address with SET.  Broadcast
+; reception is intrinsic to the Ethernet adapter; arbitrary multicast filter
+; programming is not implemented, so every other valid MCA form fails closed.
+
+100$:   BITL    #DP_ATTR_M_MCA,R8
+        BEQL    101$
+        BRW     80$
+101$:   CMPL    R7,#DP_NMA_STRING_OVERHEAD
+        BGEQU   102$
+        BRW     80$
+102$:   CMPW    2(R6),#<2+DP_NMA_ADDRESS_LENGTH>
+        BEQL    103$
+        BRW     80$
+103$:   CMPL    R7,#<DP_NMA_STRING_OVERHEAD+2+DP_NMA_ADDRESS_LENGTH>
+        BGEQU   104$
+        BRW     80$
+104$:   CMPW    4(R6),#NMA$C_LINMC_SET
+        BEQL    105$
+        BRW     80$
+105$:   CMPL    6(R6),#^XFFFFFFFF
+        BEQL    106$
+        BRW     80$
+106$:   CMPW    10(R6),#^XFFFF
+        BEQL    107$
+        BRW     80$
+107$:   BISL    #DP_ATTR_M_MCA,R8
+        ADDL    #<DP_NMA_STRING_OVERHEAD+2+DP_NMA_ADDRESS_LENGTH>,R6
+        SUBL    #<DP_NMA_STRING_OVERHEAD+2+DP_NMA_ADDRESS_LENGTH>,R7
+        BRW     DP_PARSE_SET_ATTRIBUTES
+
+; The request is retained even though V0.40 does not yet synthesize the LAN
+; common layer's automatic port-restart sequence after an adapter failure.
+; Accept only ENABLE so the stored state cannot claim any unsupported variant.
+
+120$:   BITL    #DP_ATTR_M_RES,R8
+        BEQL    121$
+        BRW     80$
+121$:   CMPL    R7,#DP_NMA_SCALAR_LENGTH
+        BGEQU   122$
+        BRW     80$
+122$:   CMPL    2(R6),#NMA$C_LINRES_ENA
+        BEQL    123$
+        BRW     80$
+123$:   BISL    #DP_ATTR_M_RES,R8
+
+75$:    ADDL    #DP_NMA_SCALAR_LENGTH,R6
+        SUBL    #DP_NMA_SCALAR_LENGTH,R7
+        BRW     DP_PARSE_SET_ATTRIBUTES
+
+80$:    MOVZWL  #SS$_BADPARAM,R0
+        RSB
+
+; SENSEMODE is an FDT-only operation.  P1 is an optional eight-byte device
+; characteristics buffer.  P2 is an optional descriptor for the supported
+; LAN attribute prefix.  The output buffers are consumed synchronously, so
+; the public IFNOWRT access check is sufficient; no LAN-private read-check
+; macro or deferred buffer lock is required.
+
+DP_SENSEMODE_FDT:
+        MOVZWL  IRP$W_FUNC(R3),R0
+        BICL3   #IO$M_FCODE,R0,R1
+        CMPL    R1,#<1@IO$V_CTRL>
+        BEQL    10$
+        BRW     DP_SENSE_BAD_FUNCTION
+10$:
+        MOVL    UCB_L_DP_CONTROLLER(R5),R2
+        BNEQ    11$
+        BRW     DP_SENSE_OFFLINE
+11$:
+        CMPL    DPCB_L_MAGIC(R2),#DP_CONTROLLER_MAGIC
+        BEQL    12$
+        BRW     DP_SENSE_OFFLINE
+12$:    BBS     #DP_CONTROLLER_V_MAC_VALID,DPCB_L_FLAGS(R2),13$
+        BRW     DP_SENSE_OFFLINE
+13$:
+
+        CLRL    IRP_L_DP_SENSE_P1(R3)
+        CLRL    IRP_L_DP_SENSE_P2(R3)
+        CLRW    IRP_W_DP_SENSE_P2SIZE(R3)
+
+        MOVL    P1(AP),R0
+        BNEQ    14$
+        BRW     DP_SENSE_CHECK_P2
+14$:
+        IFNOWRT #8,(R0),15$
+        MOVL    R0,IRP_L_DP_SENSE_P1(R3)
+        BRB     DP_SENSE_CHECK_P2
+15$:    BRW     DP_SENSE_ACCVIO
+
+DP_SENSE_CHECK_P2:
+        MOVL    P2(AP),R2
+        BNEQ    14$
+        BRW     DP_SENSE_OUTPUT
+14$:
+        IFNORD  #8,(R2),16$
+        MOVZWL  (R2),R1
+        BNEQ    15$
+        BRW     DP_SENSE_OUTPUT
+15$:
+        MOVL    4(R2),R0
+        IFNOWRT R1,(R0),16$
+        MOVL    R0,IRP_L_DP_SENSE_P2(R3)
+        MOVW    R1,IRP_W_DP_SENSE_P2SIZE(R3)
+        BRB     DP_SENSE_OUTPUT
+16$:    BRW     DP_SENSE_ACCVIO
+
+DP_SENSE_OUTPUT:
+        CLRL    R11
+        MOVZWL  #SS$_NORMAL,R0
+        MOVL    IRP_L_DP_SENSE_P2(R3),R9
+        BNEQ    10$
+        BRW     DP_SENSE_P1
+10$:
+        MOVZWL  IRP_W_DP_SENSE_P2SIZE(R3),R10
+
+        MOVZBL  UCB_B_DP_PORT_ACC(R5),R0
+        DP_SENSE_SCALAR NMA$C_PCLI_ACC,R0
+        MOVZBL  UCB_B_DP_PORT_BFN(R5),R0
+        DP_SENSE_SCALAR NMA$C_PCLI_BFN,R0
+        MOVZWL  UCB_W_DP_PORT_BUS(R5),R0
+        DP_SENSE_SCALAR NMA$C_PCLI_BUS,R0
+        DP_SENSE_SCALAR NMA$C_PCLI_FMT,#NMA$C_LINFM_ETH
+        MOVZBL  UCB_B_DP_PORT_PAD(R5),R0
+        DP_SENSE_SCALAR NMA$C_PCLI_PAD,R0
+
+        CMPL    R10,#DP_NMA_ADDRESS_ENTRY
+        BGEQU   DP_SENSE_PHA_FITS
+        BRW     DP_SENSE_OVERFLOW
+DP_SENSE_PHA_FITS:
+        MOVW    #<NMA$C_PCLI_PHA!DP_NMA_M_STRING>,(R9)+
+        MOVW    #DP_NMA_ADDRESS_LENGTH,(R9)+
+        MOVL    UCB_L_DP_CONTROLLER(R5),R2
+        MOVL    DPCB_B_MAC_REPLY(R2),(R9)+
+        MOVW    DPCB_B_MAC_REPLY+4(R2),(R9)+
+        SUBL    #DP_NMA_ADDRESS_ENTRY,R10
+        ADDL    #DP_NMA_ADDRESS_ENTRY,R11
+
+        MOVZWL  UCB_W_DP_PORT_PTY(R5),R0
+        DP_SENSE_SCALAR NMA$C_PCLI_PTY,R0
+        MOVZWL  #SS$_NORMAL,R0
+        BRB     DP_SENSE_P1
+
+DP_SENSE_OVERFLOW:
+        MOVZWL  #SS$_BUFFEROVF,R0
+
+DP_SENSE_P1:
+        MOVL    IRP_L_DP_SENSE_P1(R3),R2
+        BEQL    DP_SENSE_FINISH
+        MOVQ    UCB$B_DEVCLASS(R5),(R2)
+
+DP_SENSE_FINISH:
+        INSV    R11,#16,#16,R0
+        MOVL    UCB$L_DEVDEPEND(R5),R1
+        JMP     G^EXE$FINISHIO
+
+DP_SENSE_BAD_FUNCTION:
+        MOVZWL  #SS$_BADPARAM,R0
+        CLRL    R1
+        JMP     G^EXE$ABORTIO
+DP_SENSE_OFFLINE:
+        MOVZWL  #SS$_DEVOFFLINE,R0
+        CLRL    R1
+        JMP     G^EXE$ABORTIO
+DP_SENSE_ACCVIO:
+        MOVZWL  #SS$_ACCVIO,R0
+        CLRL    R1
+        JMP     G^EXE$ABORTIO
+
+DP_BADPARAM:
+        MOVZWL  #SS$_BADPARAM,R0
+        JMP     G^EXE$ABORTIO
+
+; ----- STARTIO and operation dispatch -----------------------------------
+
+DP_STARTIO:
+        .ENABLE LSB
+        MOVL    R3,R2
+        MOVL    UCB_L_DP_CONTROLLER(R5),R0
+        BEQL    DP_START_OFFLINE
+        CMPL    DPCB_L_MAGIC(R0),#DP_CONTROLLER_MAGIC
+        BNEQ    DP_START_OFFLINE
+        BBC     #DP_CONTROLLER_V_READY,DPCB_L_FLAGS(R0),DP_START_OFFLINE
+        BBSS    #DP_CONTROLLER_V_BUSY,DPCB_L_FLAGS(R0),DP_START_QUEUE
+
+; R0--R5 are STARTIO scratch registers, but R6--R11 belong to the interrupted
+; executive context.  A SCSI command can resume on a different interrupt
+; stack, so save the latter in the controller rather than on this stack.  The
+; BUSY interlock guarantees that only one direct STARTIO owns these fields.
+
+        MOVL    R6,DPCB_L_START_R6(R0)
+        MOVL    R7,DPCB_L_START_R7(R0)
+        MOVL    R8,DPCB_L_START_R8(R0)
+        MOVL    R9,DPCB_L_START_R9(R0)
+        MOVL    R10,DPCB_L_START_R10(R0)
+        MOVL    R11,DPCB_L_START_R11(R0)
+        BISL    #DP_CONTROLLER_M_START_ACTIVE,DPCB_L_FLAGS(R0)
+        MOVL    R0,R6
+        MOVL    R5,R3
+
+DP_START_OWNED:
+        BSBW    DP_ALLOC_SCDRP
+        BLBC    R0,DP_START_OWNED_FAILED
+        BRB     DP_START_READY
+
+; IRP queue links are controller-private while BUSY remains set.  Insertion
+; at the current tail preserves request order across cloned protocol UCBs.
+
+DP_START_QUEUE:
+        INSQUE  IRP$L_FQFL(R2),@DPCB_L_WAITQ_BL(R0)
+        RSB
+
+DP_START_OFFLINE:
+        MOVL    R5,R3
+        MOVZWL  #SS$_DEVOFFLINE,R0
+        BICL    #<DP_PORT_M_STARTING!DP_PORT_M_STOPPING>,-
+                UCB_L_DP_PORT_FLAGS(R3)
+        CLRL    R1
+        MOVL    R3,R5
+        REQCOM
+
+DP_START_OWNED_FAILED:
+        BICL    #<DP_PORT_M_STARTING!DP_PORT_M_STOPPING>,-
+                UCB_L_DP_PORT_FLAGS(R3)
+        CLRL    R1
+        PUSHR   #^M<R0,R1,R3>
+        BSBW    DP_RELEASE_CONTROLLER
+        POPR    #^M<R0,R1,R3>
+DP_START_REQCOM:
+        BSBW    DP_RESTORE_FORK_REGS
+        MOVL    R3,R5
+        REQCOM
+
+DP_START_READY:
+; Claim the sole controller SCDRP before resetting its shared coroutine stack.
+        DP_INIT_STACK
+        MOVL    DPCB_L_PDT(R6),R4
+        MOVL    R2,SCDRP$L_IRP(R5)
+
+; UNIT_INIT is not a resumable SPI command context on VAX V7.3.  Cache the
+; MAC from the first ordinary driver request instead.  Preserve the IRP in R2
+; across the coroutine and fail this request without dispatching its operation
+; if the controller cannot return a complete 0x09 reply.
+
+        BSBW    DP_ENSURE_CONTROLLER_MAC
+        BLBS    R0,DP_START_MAC_READY
+        BICL    #<DP_PORT_M_STARTING!DP_PORT_M_STOPPING>,-
+                UCB_L_DP_PORT_FLAGS(R3)
+        CLRL    R1
+        BRW     DP_COMPLETE
+DP_START_MAC_READY:
+
+        EXTZV   #IRP$V_FCODE,#IRP$S_FCODE,IRP$W_FUNC(R2),R1
+        MOVL    R1,UCB$L_DEVDEPEND(R3)
+        CLRL    UCB$L_DEVDEPND2(R3)
+        ASSUME  IRP$S_FCODE LE 7
+        DISPATCH R1,TYPE=B,<-
+                <IO$_AVAILABLE,DP_IO_ENABLE>,-
+                <IO$_DEACCESS,DP_IO_DISABLE>,-
+                <IO$_SETMODE,DP_IO_SETMODE>,-
+                <IO$_SETCHAR,DP_IO_SETMODE>,-
+                <IO$_READPBLK,DP_IO_READ>,-
+                <IO$_READLBLK,DP_IO_READ>,-
+                <IO$_READVBLK,DP_IO_READ>,-
+                <IO$_WRITEPBLK,DP_IO_WRITE>,-
+                <IO$_WRITELBLK,DP_IO_WRITE>,-
+                <IO$_WRITEVBLK,DP_IO_WRITE>>
+
+        MOVZWL  #SS$_ILLIOFUNC,R0
+        CLRL    R1
+        BRW     DP_COMPLETE
+
+DP_IO_ENABLE:
+        TSTL    DPCB_L_ACTIVE_PORTS(R6)
+        BNEQ    DP_CONTROL_SUCCESS
+        BBS     #DP_CONTROLLER_V_ENABLED,DPCB_L_FLAGS(R6),-
+                DP_CONTROL_SUCCESS
+        MOVAL   DP_ENABLE_CDB,R2
+        BSBW    DP_RUN_CONTROL
+        BLBC    R0,DP_CONTROL_RETURN
+        BISL    #DP_CONTROLLER_M_ENABLED,DPCB_L_FLAGS(R6)
+        BRB     DP_CONTROL_RETURN
+
+DP_IO_DISABLE:
+        TSTL    DPCB_L_ACTIVE_PORTS(R6)
+        BNEQ    DP_DISABLE_ACTIVE
+        BBC     #DP_CONTROLLER_V_ENABLED,DPCB_L_FLAGS(R6),-
+                DP_CONTROL_SUCCESS
+        MOVAL   DP_DISABLE_CDB,R2
+        BSBW    DP_RUN_CONTROL
+        BLBC    R0,DP_CONTROL_RETURN
+        BICL    #DP_CONTROLLER_M_ENABLED,DPCB_L_FLAGS(R6)
+        BRB     DP_CONTROL_RETURN
+DP_DISABLE_ACTIVE:
+        MOVZWL  #SS$_DEVACTIVE,R0
+        BRB     DP_CONTROL_RETURN
+DP_CONTROL_SUCCESS:
+        MOVZWL  #SS$_NORMAL,R0
+DP_CONTROL_RETURN:
+        CLRL    R1
+        BRW     DP_COMPLETE
+
+DP_IO_SETMODE:
+.IF DEFINED DP$VCI_FRONTEND
+; Revalidate the exact private encoding in STARTIO so startup/shutdown requests
+; cannot be reinterpreted merely because their otherwise-unused P1 matches.
+        MOVZWL  IRP$W_FUNC(R2),R0
+        BICL3   #IO$M_FCODE,R0,R1
+        CMPL    R1,#<1@IO$V_CTRL>
+        BEQL    1$
+        BRW     DP_SETMODE_NORMAL
+1$:     EXTZV   #IRP$V_FCODE,#IRP$S_FCODE,R0,R1
+        CMPL    R1,#IO$_SETMODE
+        BEQL    2$
+        BRW     DP_SETMODE_NORMAL
+2$:     CMPL    IRP_L_DP_VCI_CONTROL(R2),#DP_VCI_CTL_INSTALL
+        BEQL    3$
+        CMPL    IRP_L_DP_VCI_CONTROL(R2),#DP_VCI_CTL_REMOVE
+        BEQL    4$
+        BRW     DP_SETMODE_NORMAL
+3$:     BSBW    DP_VCI_INSTALL_HOOKS
+        BRW     DP_COMPLETE
+4$:     BSBW    DP_VCI_REMOVE_HOOKS
+        BRW     DP_COMPLETE
+DP_SETMODE_NORMAL:
+.ENDC
+        BBC     #IO$V_SHUTDOWN,IRP$W_FUNC(R2),DP_SETMODE_CHECK_STARTUP
+        BRW     DP_IO_STOP_PORT
+DP_SETMODE_CHECK_STARTUP:
+        BBC     #IO$V_STARTUP,IRP$W_FUNC(R2),DP_SETMODE_BAD_FUNCTION
+        BRW     DP_IO_START_PORT
+DP_SETMODE_BAD_FUNCTION:
+        BICL    #<DP_PORT_M_STARTING!DP_PORT_M_STOPPING>,-
+                UCB_L_DP_PORT_FLAGS(R3)
+        MOVZWL  #SS$_BADPARAM,R0
+        CLRL    R1
+        BRW     DP_COMPLETE
+
+DP_IO_START_PORT:
+        BBS     #DP_PORT_V_STARTING,UCB_L_DP_PORT_FLAGS(R3),-
+                DP_PORT_START_CLAIMED
+        BRW     DP_PORT_TRANSITION_LOST
+DP_PORT_START_CLAIMED:
+        TSTL    DPCB_L_ACTIVE_PORTS(R6)
+        BNEQ    DP_PORT_START_COMMIT
+        BBS     #DP_CONTROLLER_V_ENABLED,DPCB_L_FLAGS(R6),-
+                DP_PORT_START_COMMIT
+        MOVAL   DP_ENABLE_CDB,R2
+        BSBW    DP_RUN_CONTROL
+        BLBC    R0,DP_PORT_START_FAILED
+        BISL    #DP_CONTROLLER_M_ENABLED,DPCB_L_FLAGS(R6)
+DP_PORT_START_COMMIT:
+        INCL    DPCB_L_ACTIVE_PORTS(R6)
+        BICL    #DP_PORT_M_STARTING,UCB_L_DP_PORT_FLAGS(R3)
+        BISL    #DP_PORT_M_STARTED,UCB_L_DP_PORT_FLAGS(R3)
+        MOVZWL  #SS$_NORMAL,R0
+        CLRL    R1
+        BRW     DP_COMPLETE
+DP_PORT_START_FAILED:
+        BICL    #DP_PORT_M_STARTING,UCB_L_DP_PORT_FLAGS(R3)
+        CLRL    R1
+        BRW     DP_COMPLETE
+
+DP_IO_STOP_PORT:
+        BBS     #DP_PORT_V_STOPPING,UCB_L_DP_PORT_FLAGS(R3),-
+                DP_PORT_STOP_CLAIMED
+        BRW     DP_PORT_TRANSITION_LOST
+DP_PORT_STOP_CLAIMED:
+        TSTL    DPCB_L_ACTIVE_PORTS(R6)
+        BEQL    DP_PORT_STOP_INACTIVE
+        CMPL    DPCB_L_ACTIVE_PORTS(R6),#1
+        BGTRU   DP_PORT_STOP_COMMIT
+        BBC     #DP_CONTROLLER_V_ENABLED,DPCB_L_FLAGS(R6),-
+                DP_PORT_STOP_COMMIT
+        MOVAL   DP_DISABLE_CDB,R2
+        BSBW    DP_RUN_CONTROL
+        BLBC    R0,DP_PORT_STOP_FAILED
+        BICL    #DP_CONTROLLER_M_ENABLED,DPCB_L_FLAGS(R6)
+DP_PORT_STOP_COMMIT:
+        DECL    DPCB_L_ACTIVE_PORTS(R6)
+        BICL    #<DP_PORT_M_STARTED!DP_PORT_M_STOPPING>,-
+                UCB_L_DP_PORT_FLAGS(R3)
+        MOVZWL  #SS$_NORMAL,R0
+        CLRL    R1
+        BRW     DP_COMPLETE
+DP_PORT_STOP_FAILED:
+        BICL    #DP_PORT_M_STOPPING,UCB_L_DP_PORT_FLAGS(R3)
+        CLRL    R1
+        BRW     DP_COMPLETE
+DP_PORT_STOP_INACTIVE:
+        BICL    #<DP_PORT_M_STARTED!DP_PORT_M_STOPPING>,-
+                UCB_L_DP_PORT_FLAGS(R3)
+        MOVZWL  #SS$_DEVINACT,R0
+        CLRL    R1
+        BRW     DP_COMPLETE
+DP_PORT_TRANSITION_LOST:
+        MOVZWL  #SS$_DEVACTIVE,R0
+        CLRL    R1
+        BRW     DP_COMPLETE
+
+DP_IO_READ:
+        MOVL    #DP_STAGE_HANDLER,UCB$L_DEVDEPND2(R3)
+        TSTL    IRP$L_SVAPTE(R2)
+        BNEQ    DP_READ_BUFFER_OK
+        BRW     DP_BAD_LENGTH
+DP_READ_BUFFER_OK:
+        MOVAL   DP_READ_CDB,R2
+        BSBW    DP_PREPARE_READ
+        BLBS    R0,DP_READ_PREPARED
+        BRW     DP_PREPARE_FAILED
+DP_READ_PREPARED:
+        MOVL    #DP_STAGE_MAPPED,UCB$L_DEVDEPND2(R3)
+        BSBW    DP_SET_CDB_LENGTH
+        BSBW    DP_SEND_COMMAND
+        MOVL    #DP_STAGE_SENT,UCB$L_DEVDEPND2(R3)
+        PUSHL   R0
+        BSBW    DP_CLEANUP_COMMAND
+        POPL    R0
+        BLBC    R0,DP_READ_TRANSPORT_ERROR
+        BSBW    DP_DECODE_READ
+        BRW     DP_COMPLETE
+
+DP_READ_TRANSPORT_ERROR:
+        MOVL    SCDRP$L_IRP(R5),R2
+        CLRL    IRP$L_BCNT(R2)
+        CLRL    R1
+        BRW     DP_COMPLETE
+
+DP_IO_WRITE:
+        MOVL    #DP_STAGE_HANDLER,UCB$L_DEVDEPND2(R3)
+        CMPL    IRP$L_BCNT(R2),#DP_TX_MIN
+        BGEQU   DP_WRITE_MIN_OK
+        BRW     DP_BAD_LENGTH
+DP_WRITE_MIN_OK:
+        CMPL    IRP$L_BCNT(R2),#DP_TX_MAX
+        BLEQU   DP_WRITE_LENGTH_OK
+        BRW     DP_BAD_LENGTH
+DP_WRITE_LENGTH_OK:
+        MOVAL   DP_WRITE_CDB,R2
+        CLRL    R1
+        BSBW    DP_PREPARE_USER
+        BLBS    R0,DP_WRITE_PREPARED
+        BRW     DP_PREPARE_FAILED
+DP_WRITE_PREPARED:
+        MOVL    #DP_STAGE_MAPPED,UCB$L_DEVDEPND2(R3)
+        BSBW    DP_SET_CDB_LENGTH
+        BSBW    DP_SEND_COMMAND
+        MOVL    #DP_STAGE_SENT,UCB$L_DEVDEPND2(R3)
+
+DP_USER_DONE:
+        BLBC    R0,DP_USER_CLEANUP
+        MOVL    SCDRP$L_TRANS_CNT(R5),R1
+; IOC$REQCOM takes the first IOSB longword in R0: status in bits 0..15 and
+; the transfer count in bits 16..31.  R1 is the device-dependent second
+; longword, not the generic byte-count field.  All supported frames are well
+; below 65536 bytes.
+        INSV    R1,#16,#16,R0
+        CLRL    R1
+DP_USER_CLEANUP:
+        PUSHL   R0
+        PUSHL   R1
+        BSBW    DP_CLEANUP_COMMAND
+        POPL    R1
+        POPL    R0
+        BRB     DP_COMPLETE
+
+DP_PREPARE_FAILED:
+        CLRL    R1
+        PUSHL   R0
+        BSBW    DP_CLEANUP_COMMAND
+        POPL    R0
+        BRW     DP_COMPLETE
+
+DP_BAD_LENGTH:
+        MOVZWL  #SS$_IVBUFLEN,R0
+        CLRL    R1
+
+DP_COMPLETE:
+        BSBW    DP_DEALLOC_SCDRP
+        PUSHR   #^M<R0,R1,R3>
+        BSBW    DP_RELEASE_CONTROLLER
+        POPR    #^M<R0,R1,R3>
+        BSBW    DP_RESTORE_FORK_REGS
+        MOVL    R3,R5
+        REQCOM
+        .DISABLE LSB
+
+; ----- SCSI command preparation -----------------------------------------
+
+; Allocate the SPI command buffer and copy the six-byte CDB at R2.
+;
+; SPI$ALLOCATE_COMMAND_BUFFER can FORK_WAIT when the port command-buffer pool
+; is empty.  It therefore has the same executive-register ownership transition
+; as SPI$SEND_COMMAND: expose the interrupted fork before the call, replace
+; that image with the resume fork afterward, and only then restore private
+; driver registers.  The allocated buffer is returned in R2, which the capture
+; helper uses as scratch, so preserve it on the new fork's CPU stack.
+
+DP_PREPARE_CDB:
+        DP_SUBSAVE
+        DP_SUBPUSH R2
+        MOVL    #DP_COMMAND_BUFFER_SIZE,R1
+        BSBW    DP_SPI_EXPOSE_EXEC_REGS
+        SPI$ALLOCATE_COMMAND_BUFFER
+        PUSHL   R2
+        BSBW    DP_SPI_CAPTURE_RESUME_REGS
+        BSBW    DP_SPI_RESTORE_DRIVER_REGS
+        POPL    R2
+        BLBS    R0,10$
+        BRB     80$
+10$:    TSTL    R2
+        BNEQ    20$
+        MOVZWL  #SS$_INSFMEM,R0
+        BRB     80$
+20$:
+        MOVL    R2,R1
+        DP_SUBPOP R2
+        MOVB    #^XFF,(R1)
+        MOVAL   (R1)+,SCDRP$L_STS_PTR(R5)
+        MOVL    R1,SCDRP$L_CMD_PTR(R5)
+        MOVL    #DP_CDB_LENGTH,(R1)+
+        MOVW    (R2)+,(R1)+
+        MOVW    (R2)+,(R1)+
+        MOVW    (R2)+,(R1)+
+        MOVL    #10,SCDRP$L_DMA_TIMEOUT(R5)
+        CLRL    SCDRP$L_DISCON_TIMEOUT(R5)
+        MOVZWL  #SS$_NORMAL,R0
+        BRB     90$
+80$:    DP_SUBPOP R2
+90$:
+        DP_SUBRETURN
+
+DP_PREPARE_CONTROL:
+        DP_SUBSAVE
+        BSBW    DP_PREPARE_CDB
+        CLRL    SCDRP$L_BCNT(R5)
+        DP_SUBRETURN
+
+; Run a no-data interface control command and always release its command
+; buffer.  The caller supplies the CDB address in R2.
+
+DP_RUN_CONTROL:
+        DP_SUBSAVE
+        BSBW    DP_PREPARE_CONTROL
+        BLBC    R0,10$
+        BSBW    DP_SEND_COMMAND
+10$:    PUSHL   R0
+        BSBW    DP_CLEANUP_COMMAND
+        POPL    R0
+        DP_SUBRETURN
+
+; Ensure that the permanent DaynaPORT MAC/statistics block is cached.  This
+; routine is entered only from STARTIO after the caller owns the controller's
+; SCDRP and has initialized its coroutine stack.  R2 (the active IRP) is
+; preserved for the operation dispatcher.
+
+DP_ENSURE_CONTROLLER_MAC:
+        DP_SUBSAVE
+        DP_SUBPUSH R2
+        BBS     #DP_CONTROLLER_V_MAC_VALID,DPCB_L_FLAGS(R6),10$
+        BSBW    DP_READ_CONTROLLER_MAC
+        BLBC    R0,20$
+        BISL    #DP_CONTROLLER_M_MAC_VALID,DPCB_L_FLAGS(R6)
+10$:    MOVZWL  #SS$_NORMAL,R0
+20$:    DP_SUBPOP R2
+        DP_SUBRETURN
+
+; Read the permanent DaynaPORT MAC/statistics block into the DPCB.  The DPCB
+; resides in nonpaged S0 space, so construct the mapping explicitly instead
+; of borrowing user-buffer fields from the active IRP.
+
+DP_READ_CONTROLLER_MAC:
+        DP_SUBSAVE
+        MOVAL   DP_READ_MAC_CDB,R2
+        BSBW    DP_PREPARE_CDB
+        BLBC    R0,80$
+        MOVAL   DPCB_B_MAC_REPLY(R6),R2
+        MOVL    R2,SCDRP$L_SVA_USER(R5)
+        MOVL    #DP_MAC_REPLY_LENGTH,SCDRP$L_BCNT(R5)
+        CLRL    SCDRP$L_ABCNT(R5)
+        CLRL    SCDRP$L_PAD_BCNT(R5)
+        BISW    #<1@IRP$V_FUNC>,SCDRP$W_STS(R5)
+        EXTZV   #0,#9,R2,R1
+        MOVW    R1,SCDRP$W_BOFF(R5)
+        PUSHL   R3
+        JSB     G^MMG$SVAPTECHK
+        MOVL    R3,SCDRP$L_SVAPTE(R5)
+        POPL    R3
+        BISL    #<SCDRP$M_S0BUF!SCDRP$M_BUFFER_MAPPED>,-
+                SCDRP$L_SCSI_FLAGS(R5)
+        SPI$MAP_BUFFER
+        BLBC    R0,70$
+        BSBW    DP_SET_CDB_LENGTH
+        BSBW    DP_SEND_COMMAND
+        BLBC    R0,70$
+        CMPL    SCDRP$L_TRANS_CNT(R5),#DP_MAC_REPLY_LENGTH
+        BGEQU   70$
+        MOVZWL  #SS$_IVBUFLEN,R0
+70$:    PUSHL   R0
+        BSBW    DP_CLEANUP_COMMAND
+        POPL    R0
+80$:    DP_SUBRETURN
+
+.IF DEFINED DP$VCI_FRONTEND
+; Map the controller-owned Ethernet staging frame for host-to-device DMA.
+; This is intentionally separate from DP_PREPARE_USER: a VCRP is not an IRP,
+; and no user mapping fields are borrowed or overlaid.
+
+DP_PREPARE_VCI_TX:
+        DP_SUBSAVE
+        DP_SUBPUSH R2
+        BSBW    DP_PREPARE_CDB
+        DP_SUBPOP R2
+        BLBS    R0,10$
+        BRW     90$
+10$:
+        MOVAL   DPCB_B_VCI_TX_BUFFER(R6),R2
+        MOVL    R2,SCDRP$L_SVA_USER(R5)
+        MOVL    DPCB_L_VCI_TX_LENGTH(R6),SCDRP$L_BCNT(R5)
+        CLRL    SCDRP$L_ABCNT(R5)
+        CLRL    SCDRP$L_PAD_BCNT(R5)
+        BICW    #<1@IRP$V_FUNC>,SCDRP$W_STS(R5)
+        EXTZV   #0,#9,R2,R1
+        MOVW    R1,SCDRP$W_BOFF(R5)
+        PUSHL   R3
+        JSB     G^MMG$SVAPTECHK
+        MOVL    R3,SCDRP$L_SVAPTE(R5)
+        POPL    R3
+        BISL    #<SCDRP$M_S0BUF!SCDRP$M_BUFFER_MAPPED>,-
+                SCDRP$L_SCSI_FLAGS(R5)
+        SPI$MAP_BUFFER
+90$:    DP_SUBRETURN
+
+; Map the embedded raw-data tail of a lower-owned receive VCRP for a full
+; single-packet DaynaPORT READ(6).  The VCRP is controller state, not an IRP;
+; no process buffer or IRP mapping field participates in this transfer.
+
+DP_PREPARE_VCI_RX:
+        DP_SUBSAVE
+        DP_SUBPUSH R2
+        BSBW    DP_PREPARE_CDB
+        DP_SUBPOP R2
+        BLBS    R0,10$
+        BRW     90$
+10$:
+        MOVL    DPCB_L_VCI_ACTIVE_RCV(R6),R2
+        BNEQ    20$
+        BRW     80$
+20$:
+        MOVAB   VCRP$T_LAN_DATA(R2),R2
+        MOVL    R2,SCDRP$L_SVA_USER(R5)
+        MOVL    #DP_RX_MAX,SCDRP$L_BCNT(R5)
+        CLRL    SCDRP$L_ABCNT(R5)
+        CLRL    SCDRP$L_PAD_BCNT(R5)
+        BISW    #<1@IRP$V_FUNC>,SCDRP$W_STS(R5)
+        EXTZV   #0,#9,R2,R1
+        MOVW    R1,SCDRP$W_BOFF(R5)
+        PUSHL   R3
+        JSB     G^MMG$SVAPTECHK
+        MOVL    R3,SCDRP$L_SVAPTE(R5)
+        POPL    R3
+        BISL    #<SCDRP$M_S0BUF!SCDRP$M_BUFFER_MAPPED>,-
+                SCDRP$L_SCSI_FLAGS(R5)
+        SPI$MAP_BUFFER
+        BRB     90$
+80$:    MOVZWL  #SS$_IVBUFLEN,R0
+90$:    DP_SUBRETURN
+.ENDC
+
+; Map the raw portion of the FDT-allocated BUFIO block as an S0 receive
+; buffer.  Unlike DP_PREPARE_USER, this never borrows the P1 mapping fields:
+; P1 remains a checked process address consumed later by IOC$IOPOST.
+
+DP_PREPARE_READ:
+        DP_SUBSAVE
+        DP_SUBPUSH R2
+        BSBW    DP_PREPARE_CDB
+        DP_SUBPOP R2
+        BLBC    R0,90$
+        MOVL    SCDRP$L_IRP(R5),R2
+        MOVL    IRP$L_SVAPTE(R2),R1
+        BEQL    80$
+        MOVAB   DP_RX_RAW_OFFSET(R1),R1
+        MOVL    R1,SCDRP$L_SVA_USER(R5)
+        MOVL    #DP_RX_MAX,SCDRP$L_BCNT(R5)
+        CLRL    SCDRP$L_ABCNT(R5)
+        CLRL    SCDRP$L_PAD_BCNT(R5)
+        MOVW    IRP$W_FUNC(R2),SCDRP$W_FUNC(R5)
+        MOVW    IRP$W_STS(R2),SCDRP$W_STS(R5)
+        BISW    #<1@IRP$V_FUNC>,SCDRP$W_STS(R5)
+        EXTZV   #0,#9,R1,R0
+        MOVW    R0,SCDRP$W_BOFF(R5)
+        PUSHL   R3
+        MOVL    R1,R2
+        JSB     G^MMG$SVAPTECHK
+        MOVL    R3,SCDRP$L_SVAPTE(R5)
+        POPL    R3
+        BISL    #<SCDRP$M_S0BUF!SCDRP$M_BUFFER_MAPPED>,-
+                SCDRP$L_SCSI_FLAGS(R5)
+        SPI$MAP_BUFFER
+        BRB     90$
+80$:    MOVZWL  #SS$_IVBUFLEN,R0
+90$:    DP_SUBRETURN
+
+; Decode one completed DaynaPORT READ(6).  The wire length is big endian and
+; includes the Ethernet FCS.  The six-byte DaynaPORT envelope and four-byte
+; FCS are excluded, the 14-byte Ethernet header goes to RHDR/P5, and the
+; remaining user data is described to IOC$IOPOST through the BUFIO header.
+
+DP_DECODE_READ:
+        MOVL    SCDRP$L_IRP(R5),R2
+        MOVL    IRP$L_SVAPTE(R2),R7
+        BNEQ    10$
+        BRW     DP_DECODE_BAD
+10$:
+        MOVAB   DP_RX_RAW_OFFSET(R7),R8
+        MOVL    SCDRP$L_TRANS_CNT(R5),R9
+        CMPL    R9,#DP_RX_ENVELOPE
+        BGEQU   11$
+        BRW     DP_DECODE_BAD
+11$:
+
+        MOVZBL  (R8),R10
+        ASHL    #8,R10,R10
+        MOVZBL  1(R8),R0
+        BISL    R0,R10
+        BNEQ    12$
+        BRW     DP_DECODE_EMPTY
+12$:
+        CMPL    R10,#DP_RX_WIRE_MIN
+        BGEQU   13$
+        BRW     DP_DECODE_BAD
+13$:
+        CMPL    R10,#DP_RX_WIRE_MAX
+        BGTRU   DP_DECODE_BAD
+        ADDL3   #DP_RX_ENVELOPE,R10,R0
+        CMPL    R0,R9
+        BGTRU   DP_DECODE_BAD
+
+; Populate the canonical Ethernet P5 image: destination, source, EtherType.
+
+        BBC     #IRP$V_DIAGBUF,IRP$W_STS(R2),DP_DECODE_DATA
+        MOVL    IRP$L_DIAGBUF(R2),R0
+        PUSHR   #^M<R0,R1,R2,R3,R4,R5>
+        MOVC3   #DP_RHDR_C_DATA,DP_RX_ENVELOPE(R8),-
+                DP_RHDR_T_DATA(R0)
+        POPR    #^M<R0,R1,R2,R3,R4,R5>
+
+DP_DECODE_DATA:
+; R10 is frame+FCS length.  For PAD ON, the first two data bytes contain the
+; little-endian real payload size; physical Ethernet padding is not returned.
+
+        SUBL3   #<DP_RX_FCS+DP_ETH_HEADER>,R10,R9
+        MOVAB   DP_RX_ENVELOPE+DP_ETH_HEADER(R8),R11
+        CMPB    UCB_B_DP_PORT_PAD(R3),#NMA$C_STATE_ON
+        BNEQ    DP_DECODE_LIMITS
+        CMPL    R9,#2
+        BLSSU   DP_DECODE_BAD
+        MOVZWL  (R11),R0
+        CMPL    R0,R9
+        BGEQU   DP_DECODE_BAD
+        MOVL    R0,R9
+        ADDL    #2,R11
+
+DP_DECODE_LIMITS:
+        MOVZWL  UCB_W_DP_PORT_BUS(R3),R0
+        CMPL    R9,R0
+        BGTRU   DP_DECODE_BUS_OVERRUN
+        MOVZWL  #SS$_NORMAL,R0
+        CMPL    R9,IRP$L_BCNT(R2)
+        BLEQU   DP_DECODE_READY
+        MOVL    IRP$L_BCNT(R2),R9
+        MOVZWL  #SS$_DATAOVERUN,R0
+
+DP_DECODE_READY:
+        MOVL    R11,DP_BUFIO_L_DATA(R7)
+        MOVL    R9,IRP$L_BCNT(R2)
+        INSV    R9,#16,#16,R0
+        CLRL    R1
+        RSB
+
+DP_DECODE_BUS_OVERRUN:
+        CLRL    IRP$L_BCNT(R2)
+        MOVZWL  #SS$_DATAOVERUN,R0
+        CLRL    R1
+        RSB
+
+DP_DECODE_EMPTY:
+        CLRL    IRP$L_BCNT(R2)
+        MOVZWL  #SS$_ENDOFFILE,R0
+        CLRL    R1
+        RSB
+
+DP_DECODE_BAD:
+        TSTL    R2
+        BEQL    10$
+        CLRL    IRP$L_BCNT(R2)
+10$:    MOVZWL  #SS$_CTRLERR,R0
+        CLRL    R1
+        RSB
+
+; Copy the mapping information prepared by the FDT routine, set the explicit
+; DMA direction, then map the user buffer for the SCSI port.  R1 is nonzero
+; for a device-to-host transfer and zero for a host-to-device transfer.  The
+; direction must be present before SPI$MAP_BUFFER, particularly for
+; IO$_SENSEMODE, whose function-code flags need not describe a read.
+
+DP_PREPARE_USER:
+        DP_SUBSAVE
+        DP_SUBPUSH R1
+        DP_SUBPUSH R2
+        BSBW    DP_PREPARE_CDB
+        DP_SUBPOP R2
+        DP_SUBPOP R1
+        BLBC    R0,90$
+        MOVL    SCDRP$L_IRP(R5),R2
+        CLRL    SCDRP$L_ABCNT(R5)
+        MOVW    IRP$W_FUNC(R2),SCDRP$W_FUNC(R5)
+        MOVW    IRP$W_STS(R2),SCDRP$W_STS(R5)
+        MOVL    IRP$L_MEDIA(R2),SCDRP$L_MEDIA(R5)
+        MOVL    IRP$L_SVAPTE(R2),SCDRP$L_SVAPTE(R5)
+        MOVW    IRP$W_BOFF(R2),SCDRP$W_BOFF(R5)
+        MOVL    IRP$L_BCNT(R2),SCDRP$L_BCNT(R5)
+        CLRL    SCDRP$L_PAD_BCNT(R5)
+        BISL    #SCDRP$M_BUFFER_MAPPED,SCDRP$L_SCSI_FLAGS(R5)
+        TSTL    R1
+        BEQL    20$
+        BISW    #<1@IRP$V_FUNC>,SCDRP$W_STS(R5)
+        BRB     30$
+20$:    BICW    #<1@IRP$V_FUNC>,SCDRP$W_STS(R5)
+30$:
+        SPI$MAP_BUFFER
+90$:    DP_SUBRETURN
+
+; DaynaPORT uses a 16-bit big-endian transfer length in CDB bytes 3 and 4.
+
+DP_SET_CDB_LENGTH:
+        MOVL    SCDRP$L_CMD_PTR(R5),R0
+        MOVL    SCDRP$L_BCNT(R5),R1
+        EXTZV   #8,#8,R1,R2
+        MOVB    R2,7(R0)
+        MOVB    R1,8(R0)
+        RSB
+
+; Send synchronously through the connected port and validate GOOD status.
+;
+; SPI$SEND_COMMAND and SPI$ALLOCATE_COMMAND_BUFFER can suspend the class-driver
+; coroutine by returning from the current executive thread, then resume at the
+; following instruction in a later fork.  A VAX fork callback may modify
+; R0--R5 only: EXE$FORKDSPTH retains its queue header in R6 and does not save
+; R7--R11.  Preserve the driver's live high registers in the serialized DPCB
+; and expose the interrupted executive values while SPI owns the thread.  On
+; continuation, first replace that old executive image with R6--R11 from the
+; new completion fork; only then restore the private driver registers.
+; PKBDRIVER restores R3 from the SCDRP, so R3 provides the DPCB without
+; destroying the new fork's live R6.
+
+DP_SEND_COMMAND:
+        DP_SUBSAVE
+        BSBW    DP_SPI_EXPOSE_EXEC_REGS
+        SPI$SEND_COMMAND
+        BSBW    DP_SPI_CAPTURE_RESUME_REGS
+        BSBW    DP_SPI_RESTORE_DRIVER_REGS
+        BLBC    R0,20$
+        MOVZBL  @SCDRP$L_STS_PTR(R5),R1
+        BICB    #DP_SCSI_STATUS_MASK,R1
+        BEQL    20$
+        MOVZWL  #SS$_IVSTSFLG,R0
+20$:    DP_SUBRETURN
+
+DP_SPI_EXPOSE_EXEC_REGS:
+        MOVL    R7,DPCB_L_SPI_R7(R6)
+        MOVL    R8,DPCB_L_SPI_R8(R6)
+        MOVL    R9,DPCB_L_SPI_R9(R6)
+        MOVL    R10,DPCB_L_SPI_R10(R6)
+        MOVL    R11,DPCB_L_SPI_R11(R6)
+        BBS     #DP_CONTROLLER_V_FORK_ACTIVE,DPCB_L_FLAGS(R6),10$
+        BBS     #DP_CONTROLLER_V_START_ACTIVE,DPCB_L_FLAGS(R6),20$
+        RSB
+10$:    MOVL    R6,R2
+        MOVL    DPCB_L_FORK_R7(R2),R7
+        MOVL    DPCB_L_FORK_R8(R2),R8
+        MOVL    DPCB_L_FORK_R9(R2),R9
+        MOVL    DPCB_L_FORK_R10(R2),R10
+        MOVL    DPCB_L_FORK_R11(R2),R11
+        MOVL    DPCB_L_FORK_R6(R2),R6
+        RSB
+20$:    MOVL    R6,R2
+        MOVL    DPCB_L_START_R7(R2),R7
+        MOVL    DPCB_L_START_R8(R2),R8
+        MOVL    DPCB_L_START_R9(R2),R9
+        MOVL    DPCB_L_START_R10(R2),R10
+        MOVL    DPCB_L_START_R11(R2),R11
+        MOVL    DPCB_L_START_R6(R2),R6
+        RSB
+
+; A suspended SPI command resumes in a newly dispatched completion fork.  The
+; old fork was already dismissed with the register image exposed above.  Save
+; the live completion-fork image before the driver reclaims R6--R11; returning
+; the old image here corrupts whichever executive thread the SCSI completion
+; interrupted (the V0.46 dump demonstrated this with an F11 XQP base in R10).
+
+DP_SPI_CAPTURE_RESUME_REGS:
+        MOVL    UCB_L_DP_CONTROLLER(R3),R2
+        BBS     #DP_CONTROLLER_V_FORK_ACTIVE,DPCB_L_FLAGS(R2),10$
+        BBS     #DP_CONTROLLER_V_START_ACTIVE,DPCB_L_FLAGS(R2),20$
+        MOVL    R2,R6
+        RSB
+10$:    MOVL    R6,DPCB_L_FORK_R6(R2)
+        MOVL    R7,DPCB_L_FORK_R7(R2)
+        MOVL    R8,DPCB_L_FORK_R8(R2)
+        MOVL    R9,DPCB_L_FORK_R9(R2)
+        MOVL    R10,DPCB_L_FORK_R10(R2)
+        MOVL    R11,DPCB_L_FORK_R11(R2)
+        MOVL    R2,R6
+        RSB
+20$:    MOVL    R6,DPCB_L_START_R6(R2)
+        MOVL    R7,DPCB_L_START_R7(R2)
+        MOVL    R8,DPCB_L_START_R8(R2)
+        MOVL    R9,DPCB_L_START_R9(R2)
+        MOVL    R10,DPCB_L_START_R10(R2)
+        MOVL    R11,DPCB_L_START_R11(R2)
+        MOVL    R2,R6
+        RSB
+
+DP_SPI_RESTORE_DRIVER_REGS:
+        MOVL    DPCB_L_SPI_R7(R6),R7
+        MOVL    DPCB_L_SPI_R8(R6),R8
+        MOVL    DPCB_L_SPI_R9(R6),R9
+        MOVL    DPCB_L_SPI_R10(R6),R10
+        MOVL    DPCB_L_SPI_R11(R6),R11
+        RSB
+
+DP_CLEANUP_COMMAND:
+        PUSHR   #^M<R0,R1,R3>
+        BBCC    #SCDRP$V_BUFFER_MAPPED,SCDRP$L_SCSI_FLAGS(R5),10$
+        SPI$UNMAP_BUFFER
+; PKBDRIVER keeps the VAX command-slot owner in a port-private SCDRP field,
+; not in public SCDRP$L_CMD_BUF.  Therefore the public field cannot gate
+; release: the V7.3 DKDRIVER cleanup invokes this primitive unconditionally,
+; and the port deallocator explicitly accepts an SCDRP with no allocated slot.
+10$:
+        SPI$DEALLOCATE_COMMAND_BUFFER
+        CLRL    SCDRP$L_CMD_BUF(R5)
+        POPR    #^M<R0,R1,R3>
+        RSB
+
+; ----- SCDRP and pool management ----------------------------------------
+
+DP_ALLOC_SCDRP:
+        MOVAL   DPCB_L_SCDRPQ_FL(R6),R0
+        CMPL    (R0),R0
+        BEQL    90$
+        MOVL    (R0),R1
+        REMQUE  (R1),R5
+        PUSHR   #^M<R0,R1,R2,R3,R4,R5>
+        MOVC5   #0,.,#0,#SCDRP$C_LENGTH-12,12(R5)
+        POPR    #^M<R0,R1,R2,R3,R4,R5>
+        MOVL    R5,UCB_L_DP_SCDRP(R3)
+        MOVL    R5,DPCB_L_SCDRP(R6)
+        MOVL    R3,SCDRP$L_UCB(R5)
+        MOVB    UCB$B_FLCK(R3),SCDRP$B_FLCK(R5)
+        MOVL    DPCB_L_SCDT(R6),SCDRP$L_CDT(R5)
+        MOVAL   SCDRP$L_SCSI_STK-4(R5),SCDRP$L_SCSI_STK_PTR(R5)
+        MOVZWL  #SS$_NORMAL,R0
+        RSB
+90$:    MOVZWL  #SS$_DEVACTIVE,R0
+        RSB
+
+DP_DEALLOC_SCDRP:
+        MOVL    UCB_L_DP_CONTROLLER(R3),R6
+        INSQUE  SCDRP$L_FQFL(R5),DPCB_L_SCDRPQ_FL(R6)
+        CLRL    DPCB_L_SCDRP(R6)
+        CLRL    UCB_L_DP_SCDRP(R3)
+        RSB
+
+; Hand controller ownership to one queued IRP.  BUSY stays set across the
+; fork so no newly arriving clone can overtake an existing waiter.  All
+; participants use IOLOCK8, including the embedded FKB.
+
+DP_RELEASE_CONTROLLER:
+        MOVAL   DPCB_L_WAITQ_FL(R6),R0
+        CMPL    (R0),R0
+        BEQL    20$
+        MOVL    R6,R4
+        MOVAL   DPCB_B_WAIT_FKB(R6),R5
+        BSBW    DP_SCHEDULE_CONTROLLER_FORK
+        RSB
+20$:
+.IF DEFINED DP$VCI_FRONTEND
+        MOVAL   DPCB_L_VCIQ_FL(R6),R0
+        CMPL    (R0),R0
+        BEQL    25$
+        MOVL    R6,R4
+        MOVAL   DPCB_B_WAIT_FKB(R6),R5
+        BSBW    DP_SCHEDULE_CONTROLLER_FORK
+        RSB
+25$:
+        BBS     #DP_CTL_V_VCI_POLL,-
+                DPCB_L_FLAGS(R6),26$
+        BRW     28$
+26$:
+        MOVL    R6,R4
+        MOVAL   DPCB_B_WAIT_FKB(R6),R5
+        BSBW    DP_SCHEDULE_CONTROLLER_FORK
+        RSB
+.ENDC
+28$:    BBCC    #DP_CONTROLLER_V_BUSY,DPCB_L_FLAGS(R6),30$
+30$:    RSB
+
+; VAX EXE$FORK saves R3/R4 in the FKB, removes its own JSB return PC from the
+; stack into FKB$L_FPC, queues the block, and returns through the caller's
+; BSBW frame.  Keep FORK in this leaf helper: synchronous callers resume after
+; their BSBW, while the fork dispatcher enters the following BRW.  In
+; particular, never put a bare FORK directly in the timer routine while it has
+; registers and a fork lock on its stack.
+
+DP_SCHEDULE_CONTROLLER_FORK:
+        FORK
+        BRW     DP_CONTROLLER_FORK
+
+; Fork context R4 is the DPCB.  The callback may scratch R0--R5 and expects
+; R6--R11 to survive.  A queued request may suspend in SPI and resume
+; on another interrupt stack, so preserve those registers in the one active
+; controller block instead of on the fork stack.  DP_RESTORE_FORK_REGS runs
+; immediately before IOC$REQCOM returns to the executive fork dispatcher.
+; Queue entries use IRP$L_FQFL, so REMQUE's returned linkage address is
+; converted back to the IRP base before entering the already-owned STARTIO
+; path.
+
+DP_CONTROLLER_FORK:
+        MOVL    R6,DPCB_L_FORK_R6(R4)
+        MOVL    R7,DPCB_L_FORK_R7(R4)
+        MOVL    R8,DPCB_L_FORK_R8(R4)
+        MOVL    R9,DPCB_L_FORK_R9(R4)
+        MOVL    R10,DPCB_L_FORK_R10(R4)
+        MOVL    R11,DPCB_L_FORK_R11(R4)
+        BISL    #DP_CONTROLLER_M_FORK_ACTIVE,DPCB_L_FLAGS(R4)
+        MOVL    R4,R6
+        MOVAL   DPCB_L_WAITQ_FL(R6),R0
+        CMPL    (R0),R0
+        BEQL    20$
+        MOVL    (R0),R1
+        REMQUE  (R1),R2
+        SUBL    #IRP$L_FQFL,R2
+        MOVL    IRP$L_UCB(R2),R3
+        MOVL    UCB_L_DP_CONTROLLER(R3),R6
+        BRW     DP_START_OWNED
+20$:
+.IF DEFINED DP$VCI_FRONTEND
+; When both an upper transmit and a receive poll are pending, alternate them.
+; Unconditionally preferring VCIQ starves inbound TCP ACKs during a sustained
+; transmit stream; unconditionally preferring POLL can starve outbound ACKs
+; while the DaynaPORT more bit remains set.  LAST_RCV records only the most
+; recent choice and has no ownership or lifecycle meaning.
+        MOVAL   DPCB_L_VCIQ_FL(R6),R0
+        CMPL    (R0),R0
+        BNEQ    21$
+        BRW     25$
+21$:    BBC     #DP_CTL_V_VCI_POLL,DPCB_L_FLAGS(R6),22$
+        BBS     #DP_CTL_V_VCI_LAST_RCV,DPCB_L_FLAGS(R6),22$
+        BRW     25$
+22$:    BICL    #DP_CTL_M_VCI_LAST_RCV,DPCB_L_FLAGS(R6)
+        MOVL    (R0),R1
+        REMQUE  (R1),R2
+        MOVL    R2,DPCB_L_VCI_ACTIVE_VCRP(R6)
+        MOVL    VCRP$A_LAN_UCB(R2),R3
+        MOVL    UCB_L_DP_VCIB(R3),R4
+        MOVL    R4,DPCB_L_VCI_ACTIVE_VCIB(R6)
+        BRW     DP_VCI_START_OWNED
+25$:
+        BBCC    #DP_CTL_V_VCI_POLL,-
+                DPCB_L_FLAGS(R6),26$
+        BRW     27$
+26$:    BRW     30$
+27$:    BISL    #DP_CTL_M_VCI_LAST_RCV,DPCB_L_FLAGS(R6)
+        MOVL    DPCB_L_TEMPLATE_UCB(R6),R3
+        BRW     DP_VCI_RECEIVE_START_OWNED
+.ENDC
+        BBCC    #DP_CONTROLLER_V_BUSY,DPCB_L_FLAGS(R6),30$
+30$:    BSBW    DP_RESTORE_FORK_REGS
+        RSB
+
+.IF DEFINED DP$VCI_FRONTEND
+; The VCI worker runs only through the controller FKB, which is a proven
+; resumable SPI context on this VAX.  It owns the same sole SCDRP and coroutine
+; stack as STARTIO, but SCDRP$L_IRP remains zero and the typed VCRP stays in
+; dedicated DPCB fields across a possible SCSI suspension.
+
+DP_VCI_START_OWNED:
+        BSBW    DP_ALLOC_SCDRP
+        BLBC    R0,1$
+        BRW     DP_VCI_WORKER_READY
+1$:
+        CLRL    R1
+        MOVL    DPCB_L_VCI_ACTIVE_VCRP(R6),R2
+        BBS     #DP_VCI_V_FRAME,VCRP$L_FUNCTION(R2),12$
+        BRW     13$
+12$:    BICL    #DP_VCI_M_FRAME,VCRP$L_FUNCTION(R2)
+        BRW     DP_VCI_WORKER_COMPLETE_NO_SCDRP
+13$:
+        CMPL    VCRP$L_FUNCTION(R2),#VCRP$K_FC_ENABLE_PORT
+        BNEQ    10$
+        BICL    #DP_PORT_M_STARTING,UCB_L_DP_PORT_FLAGS(R3)
+        BRW     DP_VCI_WORKER_COMPLETE_NO_SCDRP
+10$:    CMPL    VCRP$L_FUNCTION(R2),#VCRP$K_FC_DISABLE_PORT
+        BEQL    11$
+        BRW     DP_VCI_WORKER_COMPLETE_NO_SCDRP
+11$:
+        BICL    #DP_PORT_M_STOPPING,UCB_L_DP_PORT_FLAGS(R3)
+        BRW     DP_VCI_WORKER_COMPLETE_NO_SCDRP
+
+DP_VCI_WORKER_READY:
+        DP_INIT_STACK
+        MOVL    DPCB_L_PDT(R6),R4
+        CLRL    SCDRP$L_IRP(R5)
+        CLRL    DPCB_L_VCI_EVENT(R6)
+        MOVL    DPCB_L_VCI_ACTIVE_VCRP(R6),R2
+        CMPL    VCRP$L_FUNCTION(R2),#VCRP$K_FC_ENABLE_PORT
+        BNEQ    20$
+        BRW     DP_VCI_WORKER_ENABLE
+20$:    CMPL    VCRP$L_FUNCTION(R2),#VCRP$K_FC_DISABLE_PORT
+        BNEQ    21$
+        BRW     DP_VCI_WORKER_DISABLE
+21$:    CMPL    VCRP$L_FUNCTION(R2),#VCRP$K_FC_TRANSMIT
+        BNEQ    22$
+        BRW     DP_VCI_WORKER_TRANSMIT
+22$:    BBS     #DP_VCI_V_FRAME,VCRP$L_FUNCTION(R2),23$
+        BRW     24$
+23$:    BICL    #DP_VCI_M_FRAME,VCRP$L_FUNCTION(R2)
+        BRW     DP_VCI_WORKER_TRANSMIT_FRAME
+24$:
+        MOVZWL  #SS$_ILLIOFUNC,R0
+        CLRL    R1
+        BRW     DP_VCI_WORKER_COMPLETE
+
+DP_VCI_WORKER_ENABLE:
+        TSTL    DPCB_L_ACTIVE_PORTS(R6)
+        BNEQ    30$
+        BBS     #DP_CONTROLLER_V_ENABLED,DPCB_L_FLAGS(R6),30$
+        MOVAL   DP_ENABLE_CDB,R2
+        BSBW    DP_RUN_CONTROL
+        BLBS    R0,32$
+        BRW     31$
+32$:
+        BISL    #DP_CONTROLLER_M_ENABLED,DPCB_L_FLAGS(R6)
+30$:    BICL    #DP_PORT_M_STARTING,UCB_L_DP_PORT_FLAGS(R3)
+        BISL    #DP_PORT_M_STARTED,UCB_L_DP_PORT_FLAGS(R3)
+        INCL    DPCB_L_ACTIVE_PORTS(R6)
+        INCL    DPCB_L_VCI_ACTIVE_PORTS(R6)
+        BSBW    DP_VCI_START_POLLER
+        MOVL    #VCRP$K_EC_DLL_PORT_USABLE,DPCB_L_VCI_EVENT(R6)
+        MOVZWL  #SS$_NORMAL,R0
+        CLRL    R1
+        BRW     DP_VCI_WORKER_COMPLETE
+31$:    BICL    #DP_PORT_M_STARTING,UCB_L_DP_PORT_FLAGS(R3)
+        CLRL    R1
+        BRW     DP_VCI_WORKER_COMPLETE
+
+DP_VCI_WORKER_DISABLE:
+        TSTL    DPCB_L_ACTIVE_PORTS(R6)
+        BNEQ    43$
+        BRW     41$
+43$:
+        CMPL    DPCB_L_ACTIVE_PORTS(R6),#1
+        BGTRU   40$
+        BBC     #DP_CONTROLLER_V_ENABLED,DPCB_L_FLAGS(R6),40$
+        MOVAL   DP_DISABLE_CDB,R2
+        BSBW    DP_RUN_CONTROL
+        BLBS    R0,44$
+        BRW     42$
+44$:
+        BICL    #DP_CONTROLLER_M_ENABLED,DPCB_L_FLAGS(R6)
+40$:    DECL    DPCB_L_ACTIVE_PORTS(R6)
+        DECL    DPCB_L_VCI_ACTIVE_PORTS(R6)
+41$:    BICL    #<DP_PORT_M_STARTED!DP_PORT_M_STOPPING>,-
+                UCB_L_DP_PORT_FLAGS(R3)
+        MOVL    #VCRP$K_EC_DLL_PORT_UNUSABLE,DPCB_L_VCI_EVENT(R6)
+        MOVZWL  #SS$_NORMAL,R0
+        CLRL    R1
+        BRW     DP_VCI_WORKER_COMPLETE
+42$:    BICL    #DP_PORT_M_STOPPING,UCB_L_DP_PORT_FLAGS(R3)
+        CLRL    R1
+        BRW     DP_VCI_WORKER_COMPLETE
+
+; Classify the already bounded, contiguous Ethernet transmit buffer.  Return
+; R0=1 and the raw network-order ICMP identifier/sequence longword in R1 only
+; for an IPv4 ICMP Echo Request.  All scratch registers are preserved.
+
+DP_VCI_CLASSIFY_TX_ICMP:
+        PUSHR   #^M<R2,R3>
+        CLRL    R0
+        CLRL    R1
+        CMPL    DPCB_L_VCI_TX_LENGTH(R6),-
+                #<DP_ETH_HEADER+<DP_IP_MIN_IHL*4>+DP_ICMP_HEADER>
+        BGEQU   10$
+        BRW     90$
+10$:    CMPW    DPCB_B_VCI_TX_BUFFER+12(R6),#DP_ETH_PTY_IP
+        BEQL    11$
+        BRW     90$
+11$:    MOVZBL  DPCB_B_VCI_TX_BUFFER+DP_ETH_HEADER(R6),R2
+        EXTZV   #4,#4,R2,R3
+        CMPL    R3,#DP_IP_VERSION
+        BEQL    12$
+        BRW     90$
+12$:    EXTZV   #0,#4,R2,R2
+        CMPL    R2,#DP_IP_MIN_IHL
+        BGEQU   13$
+        BRW     90$
+13$:    CMPB    DPCB_B_VCI_TX_BUFFER+DP_ETH_HEADER+9(R6),-
+                #DP_IP_PROTOCOL_ICMP
+        BEQL    14$
+        BRW     90$
+14$:    ASHL    #2,R2,R2
+        ADDL2   #DP_ETH_HEADER,R2
+        ADDL3   #DP_ICMP_HEADER,R2,R3
+        CMPL    DPCB_L_VCI_TX_LENGTH(R6),R3
+        BGEQU   15$
+        BRW     90$
+15$:    MOVAB   DPCB_B_VCI_TX_BUFFER(R6),R3
+        ADDL2   R3,R2
+        CMPB    (R2),#DP_ICMP_ECHO_REQUEST
+        BEQL    16$
+        BRW     90$
+16$:    MOVL    4(R2),R1
+        MOVL    #1,R0
+90$:    POPR    #^M<R2,R3>
+        RSB
+
+DP_VCI_WORKER_TRANSMIT:
+        BSBW    DP_ENSURE_CONTROLLER_MAC
+        BLBS    R0,50$
+        CLRL    R1
+        BRW     DP_VCI_WORKER_COMPLETE
+50$:    MOVL    DPCB_L_VCI_ACTIVE_VCRP(R6),R2
+        MOVL    VCRP$Q_LAN_T_DEST(R2),DPCB_B_VCI_TX_BUFFER(R6)
+        MOVW    VCRP$Q_LAN_T_DEST+4(R2),DPCB_B_VCI_TX_BUFFER+4(R6)
+        MOVL    DPCB_B_MAC_REPLY(R6),DPCB_B_VCI_TX_BUFFER+6(R6)
+        MOVW    DPCB_B_MAC_REPLY+4(R6),DPCB_B_VCI_TX_BUFFER+10(R6)
+        MOVW    UCB_W_DP_PORT_PTY(R3),DPCB_B_VCI_TX_BUFFER+12(R6)
+
+; MOVC5 copies the embedded payload and zero-fills the rest of the physical
+; frame.  If a direct-SVA DCBE follows, MOVC3 overlays its bytes immediately
+; after the embedded segment.  The completion byte count follows native LAN
+; drivers and includes physical Ethernet padding.
+
+        MOVL    VCRP$L_TOTAL_PDU_SIZE(R2),R0
+        ADDL3   #DP_ETH_HEADER,R0,R7
+        CMPL    R7,#DP_TX_MIN
+        BGEQU   51$
+        MOVL    #DP_TX_MIN,R7
+51$:    MOVL    R7,DPCB_L_VCI_TX_LENGTH(R6)
+        SUBL3   #DP_ETH_HEADER,R7,R8
+        MOVAB   DPCB_B_VCI_TX_BUFFER+DP_ETH_HEADER(R6),R9
+        MOVL    VCRP$L_BCNT(R2),R0
+        MOVL    R0,R11
+        ADDL3   VCRP$L_BOFF(R2),R2,R1
+        MOVL    VCRP$A_DCB_LINK(R2),R10
+        PUSHR   #^M<R2,R3,R4,R5>
+        MOVC5   R0,(R1),#0,R8,(R9)
+        TSTL    R10
+        BEQL    511$
+        MOVL    DCBE$L_BCNT(R10),R0
+        BEQL    511$
+        MOVL    DCBE$L_BUFFER_ADDRESS(R10),R1
+        ADDL3   R9,R11,R3
+        MOVC3   R0,(R1),(R3)
+511$:   POPR    #^M<R2,R3,R4,R5>
+        BRW     DP_VCI_WORKER_TRANSMIT_SEND
+
+; TRANSMIT_FRAME already includes the static Ethernet header.  Copy the full
+; frame, fill only the per-request destination address, and apply physical
+; minimum-frame padding without changing the upper-owned VCRP descriptor.
+
+DP_VCI_WORKER_TRANSMIT_FRAME:
+        BSBW    DP_ENSURE_CONTROLLER_MAC
+        BLBS    R0,54$
+        CLRL    R1
+        BRW     DP_VCI_WORKER_COMPLETE
+54$:    MOVL    DPCB_L_VCI_ACTIVE_VCRP(R6),R2
+        MOVL    VCRP$L_TOTAL_PDU_SIZE(R2),R7
+        CMPL    R7,#DP_TX_MIN
+        BGEQU   55$
+        MOVL    #DP_TX_MIN,R7
+55$:    MOVL    R7,DPCB_L_VCI_TX_LENGTH(R6)
+        MOVAB   DPCB_B_VCI_TX_BUFFER(R6),R9
+        MOVL    VCRP$L_BCNT(R2),R0
+        MOVL    R0,R11
+        ADDL3   VCRP$L_BOFF(R2),R2,R1
+        MOVL    VCRP$A_DCB_LINK(R2),R10
+        PUSHR   #^M<R2,R3,R4,R5>
+        MOVC5   R0,(R1),#0,R7,(R9)
+        TSTL    R10
+        BEQL    551$
+        MOVL    DCBE$L_BCNT(R10),R0
+        BEQL    551$
+        MOVL    DCBE$L_BUFFER_ADDRESS(R10),R1
+        ADDL3   R9,R11,R3
+        MOVC3   R0,(R1),(R3)
+551$:   POPR    #^M<R2,R3,R4,R5>
+        MOVL    VCRP$Q_LAN_T_DEST(R2),DPCB_B_VCI_TX_BUFFER(R6)
+        MOVW    VCRP$Q_LAN_T_DEST+4(R2),DPCB_B_VCI_TX_BUFFER+4(R6)
+
+DP_VCI_WORKER_TRANSMIT_SEND:
+        BSBW    DP_VCI_CLASSIFY_TX_ICMP
+        BLBS    R0,561$
+        BRW     562$
+561$:   INCL    DPCB_L_VCI_TX_ICMP_SEEN(R6)
+        MOVL    R1,DPCB_L_VCI_TX_ICMP_IDSEQ(R6)
+562$:
+        MOVAL   DP_WRITE_CDB,R2
+        BSBW    DP_PREPARE_VCI_TX
+        BLBC    R0,52$
+        BSBW    DP_SET_CDB_LENGTH
+        BSBW    DP_SEND_COMMAND
+52$:    PUSHL   R0
+        BSBW    DP_CLEANUP_COMMAND
+        POPL    R0
+        BLBC    R0,53$
+        MOVL    DPCB_L_VCI_TX_LENGTH(R6),R1
+        INSV    R1,#16,#16,R0
+        BRW     DP_VCI_WORKER_COMPLETE
+53$:    CLRL    R1
+
+; Deallocate transport state before handing controller ownership to the next
+; typed request.  The status is stored before any upper callback can reclaim
+; the VCRP.  Management completion precedes its state event.
+
+DP_VCI_WORKER_COMPLETE:
+        BSBW    DP_DEALLOC_SCDRP
+DP_VCI_WORKER_COMPLETE_NO_SCDRP:
+        MOVL    DPCB_L_VCI_ACTIVE_VCRP(R6),R2
+        MOVL    DPCB_L_VCI_ACTIVE_VCIB(R6),R4
+        MOVQ    R0,VCRP$Q_REQUEST_STATUS(R2)
+        MOVL    VCRP$L_FUNCTION(R2),R7
+        CMPL    R7,#VCRP$K_FC_TRANSMIT
+        BEQL    490$
+        BRW     500$
+490$:
+        INCL    DPCB_L_VCI_TX_COMPLETE_COUNT(R6)
+        MOVL    R0,DPCB_L_VCI_TX_STATUS(R6)
+        MOVL    R1,DPCB_L_VCI_TX_STATUS2(R6)
+        BLBS    R0,499$
+        BRW     500$
+499$:   PUSHL   R0
+        PUSHL   R1
+        BSBW    DP_VCI_CLASSIFY_TX_ICMP
+        BLBS    R0,498$
+        BRW     497$
+498$:   INCL    DPCB_L_VCI_TX_ICMP_COMPLETE(R6)
+        MOVL    R1,DPCB_L_VCI_TX_ICMP_IDSEQ(R6)
+497$:   MOVL    (SP)+,R1
+        MOVL    (SP)+,R0
+500$:
+; Keep the first asynchronous result separate from synchronous PORTMGMT
+; validation.  This distinguishes a rejected P2 list from an ENABLE CDB
+; failure without retaining an upper-owned VCRP after completion.
+        TSTL    DPCB_L_VCI_WORK_STATUS(R6)
+        BNEQ    501$
+        MOVL    VCRP$L_FUNCTION(R2),DPCB_L_VCI_WORK_FUNCTION(R6)
+        MOVL    R0,DPCB_L_VCI_WORK_STATUS(R6)
+        MOVL    R1,DPCB_L_VCI_WORK_STATUS2(R6)
+501$:
+        MOVL    DPCB_L_VCI_EVENT(R6),R8
+        CLRL    DPCB_L_VCI_ACTIVE_VCRP(R6)
+        CLRL    DPCB_L_VCI_ACTIVE_VCIB(R6)
+        CLRL    DPCB_L_VCI_EVENT(R6)
+; Keep the executive register image private until every upper VCM callback
+; has returned.  A second queued controller fork can otherwise snapshot a
+; high register clobbered by PORTMGMT_COMPLETE/REPORT_EVENT and later return
+; that value to the interrupted process.  The DPCB pointer on the CPU stack
+; survives the synchronous JSB callbacks and permits the final restore.
+        PUSHL   R6
+        PUSHL   R2
+        PUSHL   R4
+        PUSHL   R8
+        PUSHL   R7
+        BSBW    DP_RELEASE_CONTROLLER
+        MOVL    (SP)+,R0
+        MOVL    (SP)+,R2
+        MOVL    (SP)+,R4
+        MOVL    (SP)+,R3
+        CMPL    R0,#VCRP$K_FC_TRANSMIT
+        BNEQ    60$
+        DECL    VCIB$L_LAN_OOCNT(R4)
+        JSB     @VCIB$A_TRANSMIT_COMPLETE(R4)
+        MOVL    (SP)+,R6
+        BSBW    DP_RESTORE_FORK_REGS
+        RSB
+; Match the resident LAN VCM lifecycle.  A failed ENABLE drops its outstanding
+; count before returning a VCRP which may let the upper VCM delete the port.
+; A successful ENABLE keeps the count through PORTMGMT_COMPLETE and the
+; PORT_USABLE event, then drops it.  DISABLE is not counted as an outstanding
+; operation because its callback can make the VCIB cease to exist.
+60$:    CLRL    R1
+        CMPL    R0,#VCRP$K_FC_ENABLE_PORT
+        BNEQ    603$
+        TSTL    R2
+        BNEQ    602$
+        DECL    VCIB$L_LAN_OOCNT(R4)
+        BRB     603$
+602$:   INCL    R1
+603$:   PUSHL   R1
+        PUSHL   R2
+        PUSHL   R4
+        JSB     @VCIB$A_PORTMGMT_COMPLETE(R4)
+        POPL    R4
+        POPL    R2
+        TSTL    R2
+        BNEQ    601$
+        BRW     64$
+601$:
+        CMPL    R2,#VCRP$K_EC_DLL_PORT_USABLE
+        BNEQ    61$
+        BISW    #VCIB$M_DLL_PORT_STATUS,VCIB$W_DLL_FLAGS(R4)
+        BRB     62$
+61$:    BICW    #VCIB$M_DLL_PORT_STATUS,VCIB$W_DLL_FLAGS(R4)
+62$:    TSTL    VCIB$A_REPORT_EVENT(R4)
+        BEQL    64$
+        MOVL    R2,R1
+        CLRL    R2
+        JSB     @VCIB$A_REPORT_EVENT(R4)
+64$:    POPL    R0
+        BEQL    65$
+        DECL    VCIB$L_LAN_OOCNT(R4)
+65$:    MOVL    (SP)+,R6
+        BSBW    DP_RESTORE_FORK_REGS
+        RSB
+
+; A poll request owns BUSY but has no upper VCRP in the typed request FIFO.
+; Recheck all state after dequeuing because DISABLE may have run before the
+; remembered poll.  Pop one lower-owned receive VCRP, map its embedded raw
+; tail, issue a single READ(6), and return controller ownership before any
+; immediate follow-up selected by the DaynaPORT "more" bit.
+
+DP_VCI_RECEIVE_START_OWNED:
+        BBS     #DP_CONTROLLER_V_ENABLED,DPCB_L_FLAGS(R6),1$
+        BRW     80$
+1$:
+        TSTL    DPCB_L_VCI_ACTIVE_PORTS(R6)
+        BNEQ    2$
+        BRW     80$
+2$:
+        MOVAL   DPCB_L_VCI_RCVQ_FL(R6),R0
+        CMPL    (R0),R0
+        BNEQ    3$
+        INCL    DPCB_L_VCI_RCV_NO_BUFFER_COUNT(R6)
+        BRW     80$
+3$:
+        MOVL    (R0),R1
+        REMQUE  (R1),R2
+        MOVL    R2,DPCB_L_VCI_ACTIVE_RCV(R6)
+
+        BSBW    DP_ALLOC_SCDRP
+        BLBS    R0,4$
+        BRW     70$
+4$:
+        DP_INIT_STACK
+        MOVL    DPCB_L_PDT(R6),R4
+        CLRL    SCDRP$L_IRP(R5)
+        MOVAL   DP_READ_CDB,R2
+        BSBW    DP_PREPARE_VCI_RX
+        BLBC    R0,50$
+        BSBW    DP_SET_CDB_LENGTH
+        BSBW    DP_SEND_COMMAND
+50$:    PUSHL   R0
+        BSBW    DP_CLEANUP_COMMAND
+        POPL    R0
+        BLBC    R0,60$
+        BSBW    DP_VCI_DECODE_RECEIVE
+        BRB     65$
+60$:    BSBW    DP_VCI_REQUEUE_ACTIVE_RCV
+65$:    BSBW    DP_DEALLOC_SCDRP
+        BRB     80$
+70$:    BSBW    DP_VCI_REQUEUE_ACTIVE_RCV
+80$:    BSBW    DP_RELEASE_CONTROLLER
+        BSBW    DP_RESTORE_FORK_REGS
+        RSB
+
+; Validate the six-byte DaynaPORT envelope and Ethernet frame, select the
+; first started exclusive-Ethernet VCI port whose PTY equals the on-wire
+; EtherType, and pass the lower-owned VCRP upward.  The four-byte FCS and the
+; fourteen-byte MAC header are excluded from BCNT; A_LAN_R_HEADER points at
+; the destination address and BOFF points at the protocol payload.
+
+DP_VCI_DECODE_RECEIVE:
+        MOVL    DPCB_L_VCI_ACTIVE_RCV(R6),R2
+        BEQL    101$
+        BRW     DP_VCI_DECODE_HAVE_BUFFER
+101$:
+        BRW     DP_VCI_DECODE_RETURN
+DP_VCI_DECODE_HAVE_BUFFER:
+        MOVL    SCDRP$L_TRANS_CNT(R5),R7
+        CMPL    R7,#DP_RX_ENVELOPE
+        BLSSU   102$
+        BRW     DP_VCI_DECODE_HAVE_ENVELOPE
+102$:
+        BRW     DP_VCI_DECODE_REQUEUE
+DP_VCI_DECODE_HAVE_ENVELOPE:
+        MOVAB   VCRP$T_LAN_DATA(R2),R8
+        BBC     #4,5(R8),10$
+        BISL    #DP_CTL_M_VCI_POLL,DPCB_L_FLAGS(R6)
+10$:    MOVZBL  (R8),R9
+        ASHL    #8,R9,R9
+        MOVZBL  1(R8),R0
+        BISL    R0,R9
+        BEQL    103$
+; Some ZuluSCSI firmware observations do not reliably advertise the more bit
+; while a burst is arriving.  Drain until the first empty READ instead: one
+; nonempty frame requests exactly one immediate follow-up.  The controller's
+; TX/RX alternation still prevents a sustained receive burst from starving TX.
+        BISL    #DP_CTL_M_VCI_POLL,DPCB_L_FLAGS(R6)
+        BRW     DP_VCI_DECODE_HAVE_LENGTH
+103$:
+        BRW     DP_VCI_DECODE_REQUEUE
+DP_VCI_DECODE_HAVE_LENGTH:
+        CMPL    R9,#DP_RX_WIRE_MIN
+        BLSSU   104$
+        BRW     DP_VCI_DECODE_MIN_OK
+104$:
+        BRW     DP_VCI_DECODE_REQUEUE
+DP_VCI_DECODE_MIN_OK:
+        CMPL    R9,#DP_RX_WIRE_MAX
+        BGTRU   105$
+        BRW     DP_VCI_DECODE_MAX_OK
+105$:
+        BRW     DP_VCI_DECODE_REQUEUE
+DP_VCI_DECODE_MAX_OK:
+        ADDL3   #DP_RX_ENVELOPE,R9,R0
+        CMPL    R0,R7
+        BGTRU   106$
+        BRW     DP_VCI_DECODE_TRANSFER_OK
+106$:
+        BRW     DP_VCI_DECODE_REQUEUE
+DP_VCI_DECODE_TRANSFER_OK:
+
+; R10 is a transient flag carried only to the selected VCI-port delivery
+; point.  It never changes protocol selection or the receive descriptor.
+
+        CLRL    R10
+
+; Preserve one stable ARP snapshot before this lower-owned VCRP is returned
+; and reused.  The first 32 MAC-frame bytes include DA, SA, EtherType, and the
+; complete fixed ARP header through the start of its addresses.  This is
+; passive telemetry only; protocol selection and completion are unchanged.
+
+        CMPW    DP_RX_ENVELOPE+12(R8),#DP_ETH_PTY_ARP
+        BEQL    18$
+        BRW     19$
+18$:    INCL    DPCB_L_VCI_RCV_ARP_SEEN(R6)
+        MOVL    R9,DPCB_L_VCI_RCV_ARP_WIRE(R6)
+        MOVL    SCDRP$L_TRANS_CNT(R5),-
+                DPCB_L_VCI_RCV_ARP_TRANSFER(R6)
+        MOVL    DP_RX_ENVELOPE(R8),DPCB_L_VCI_RCV_ARP_RAW0(R6)
+        MOVL    DP_RX_ENVELOPE+4(R8),DPCB_L_VCI_RCV_ARP_RAW1(R6)
+        MOVL    DP_RX_ENVELOPE+8(R8),DPCB_L_VCI_RCV_ARP_RAW2(R6)
+        MOVL    DP_RX_ENVELOPE+12(R8),DPCB_L_VCI_RCV_ARP_RAW3(R6)
+        MOVL    DP_RX_ENVELOPE+16(R8),DPCB_L_VCI_RCV_ARP_RAW4(R6)
+        MOVL    DP_RX_ENVELOPE+20(R8),DPCB_L_VCI_RCV_ARP_RAW5(R6)
+        MOVL    DP_RX_ENVELOPE+24(R8),DPCB_L_VCI_RCV_ARP_RAW6(R6)
+        MOVL    DP_RX_ENVELOPE+28(R8),DPCB_L_VCI_RCV_ARP_RAW7(R6)
+19$:
+
+; Classify a bounded IPv4 ICMP Echo Reply before the lower buffer can be
+; returned and reused.  R9 includes the Ethernet header and FCS.  Validate the
+; version, variable IHL, protocol, and complete ICMP header before dereference.
+
+        CMPW    DP_RX_ENVELOPE+12(R8),#DP_ETH_PTY_IP
+        BEQL    191$
+        BRW     199$
+191$:   MOVAB   DP_RX_ENVELOPE+DP_ETH_HEADER(R8),R0
+        MOVZBL  (R0),R1
+        EXTZV   #4,#4,R1,R7
+        CMPL    R7,#DP_IP_VERSION
+        BEQL    192$
+        BRW     199$
+192$:   EXTZV   #0,#4,R1,R1
+        CMPL    R1,#DP_IP_MIN_IHL
+        BGEQU   193$
+        BRW     199$
+193$:   CMPB    9(R0),#DP_IP_PROTOCOL_ICMP
+        BEQL    194$
+        BRW     199$
+194$:   ASHL    #2,R1,R1
+        ADDL3   #<DP_ETH_HEADER+DP_RX_FCS+DP_ICMP_HEADER>,R1,R7
+        CMPL    R9,R7
+        BGEQU   195$
+        BRW     199$
+195$:   ADDL2   R0,R1
+        CMPB    (R1),#DP_ICMP_ECHO_REPLY
+        BEQL    196$
+        BRW     199$
+196$:   INCL    DPCB_L_VCI_RCV_ICMP_SEEN(R6)
+        MOVL    4(R1),DPCB_L_VCI_RCV_ICMP_IDSEQ(R6)
+        MOVL    R9,DPCB_L_VCI_RCV_ICMP_WIRE(R6)
+        MOVL    SCDRP$L_TRANS_CNT(R5),-
+                DPCB_L_VCI_RCV_ICMP_TRANSFER(R6)
+        MOVL    #1,R10
+199$:
+
+        MOVL    DPCB_L_VCI_PORTS(R6),R7
+20$:    BNEQ    201$
+        BRW     DP_VCI_DECODE_REQUEUE
+201$:
+        BBS     #DP_PORT_V_STARTED,UCB_L_DP_PORT_FLAGS(R7),21$
+        BRB     29$
+21$:    CMPW    VCRP$T_LAN_DATA+DP_RX_ENVELOPE+12(R2),-
+                UCB_W_DP_PORT_PTY(R7)
+        BEQL    30$
+29$:    MOVL    UCB_L_DP_VCI_NEXT(R7),R7
+        BRB     20$
+30$:    MOVL    UCB_L_DP_VCIB(R7),R4
+        BNEQ    301$
+        BRW     DP_VCI_DECODE_REQUEUE
+301$:
+        TSTL    VCIB$A_RECEIVE_COMPLETE(R4)
+        BNEQ    302$
+        BRW     DP_VCI_DECODE_REQUEUE
+302$:
+
+; Record whether the validated ARP frame also found an active protocol port.
+; These pointers remain diagnostic identities only; the VCRP can be returned
+; immediately by the upper callback.
+
+        CMPW    VCRP$T_LAN_DATA+DP_RX_ENVELOPE+12(R2),-
+                #DP_ETH_PTY_ARP
+        BEQL    303$
+        BRW     304$
+303$:   INCL    DPCB_L_VCI_RCV_ARP_DELIVER(R6)
+        MOVL    R2,DPCB_L_VCI_RCV_ARP_VCRP(R6)
+        MOVL    R4,DPCB_L_VCI_RCV_ARP_VCIB(R6)
+        MOVL    R7,DPCB_L_VCI_RCV_ARP_UCB(R6)
+304$:
+        TSTL    R10
+        BNEQ    305$
+        BRW     306$
+305$:   INCL    DPCB_L_VCI_RCV_ICMP_DELIVER(R6)
+306$:
+
+; Enforce the optional upper-client receive limit exactly as the resident LAN
+; path does.  The low creator longword is zero for unlimited clients and the
+; VCIB for limited clients; the high longword always retains the DPCB owner.
+
+        CLRL    VCRP$Q_CREATOR_DATA(R2)
+        BBC     #VCIB$V_LAN_RCV_LIM,VCIB$W_LAN_CLIENT_FLAGS(R4),40$
+        CMPW    VCIB$W_LAN_OUT_RCV(R4),VCIB$W_LAN_MAX_RCV(R4)
+        BLSSU   41$
+        BRW     75$
+41$:
+        INCW    VCIB$W_LAN_OUT_RCV(R4)
+        MOVL    R4,VCRP$Q_CREATOR_DATA(R2)
+40$:    MOVL    R6,VCRP$Q_CREATOR_DATA+4(R2)
+        MOVAB   DP_VCI_RETURN_RECEIVE,VCRP$A_DEALLOC_RTN(R2)
+        MOVL    #VCRP$K_FC_RECEIVE,VCRP$L_FUNCTION(R2)
+        CLRW    VCRP$W_COMMON_FLAGS(R2)
+        MOVQ    #SS$_NORMAL,VCRP$Q_REQUEST_STATUS(R2)
+        CLRL    VCRP$A_DCB_LINK(R2)
+        MOVAB   VCRP$T_LAN_DATA+DP_RX_ENVELOPE(R2),-
+                VCRP$L_BUFFER_ADDRESS(R2)
+        MOVAB   VCRP$T_LAN_DATA+DP_RX_ENVELOPE(R2),-
+                VCRP$A_LAN_R_HEADER(R2)
+        MOVL    #<VCRP$T_LAN_DATA+DP_RX_ENVELOPE+DP_ETH_HEADER>,-
+                VCRP$L_BOFF(R2)
+        SUBL3   #<DP_RX_FCS+DP_ETH_HEADER>,R9,R0
+        MOVL    R0,VCRP$L_BCNT(R2)
+        MOVL    R0,VCRP$L_TOTAL_PDU_SIZE(R2)
+        CLRB    VCRP$B_LAN_FC(R2)
+        MOVL    R7,VCRP$A_LAN_UCB(R2)
+        INCL    DPCB_L_VCI_RCV_DELIVER_COUNT(R6)
+        SUBL3   DPCB_L_VCI_RCV_RETURN_COUNT(R6),-
+                DPCB_L_VCI_RCV_DELIVER_COUNT(R6),R0
+        CMPL    R0,DPCB_L_VCI_RCV_MAX_OUTSTANDING(R6)
+        BLEQU   307$
+        MOVL    R0,DPCB_L_VCI_RCV_MAX_OUTSTANDING(R6)
+307$:
+        MOVL    R2,DPCB_L_VCI_RCV_LAST_VCRP(R6)
+        MOVL    R4,DPCB_L_VCI_RCV_LAST_VCIB(R6)
+        MOVL    VCRP$L_BOFF(R2),DPCB_L_VCI_RCV_LAST_BOFF(R6)
+        MOVL    VCRP$L_BCNT(R2),DPCB_L_VCI_RCV_LAST_BCNT(R6)
+        MOVL    VCRP$L_BUFFER_ADDRESS(R2),-
+                DPCB_L_VCI_RCV_LAST_BUFFER(R6)
+        MOVL    VCRP$A_LAN_R_HEADER(R2),-
+                DPCB_L_VCI_RCV_LAST_HEADER(R6)
+        MOVL    R9,DPCB_L_VCI_RCV_LAST_WIRE(R6)
+        MOVL    SCDRP$L_TRANS_CNT(R5),-
+                DPCB_L_VCI_RCV_LAST_TRANSFER(R6)
+        CLRL    DPCB_L_VCI_ACTIVE_RCV(R6)
+        MOVL    R2,R3
+        PUSHL   R6
+        JSB     @VCIB$A_RECEIVE_COMPLETE(R4)
+        MOVL    (SP)+,R6
+        MOVL    DPCB_L_TEMPLATE_UCB(R6),R3
+        RSB
+
+; The selected client is already at its outstanding receive limit.  Return
+; the lower buffer first, then report the standard receive-PDU-lost event.
+
+75$:    BSBW    DP_VCI_REQUEUE_ACTIVE_RCV
+        TSTL    VCIB$A_REPORT_EVENT(R4)
+        BNEQ    751$
+        BRW     DP_VCI_DECODE_RETURN
+751$:
+        MOVL    #VCRP$K_EC_LAN_RCV_PDU_LOST,R1
+        PUSHL   R6
+        JSB     @VCIB$A_REPORT_EVENT(R4)
+        MOVL    (SP)+,R6
+        MOVL    DPCB_L_TEMPLATE_UCB(R6),R3
+        RSB
+DP_VCI_DECODE_REQUEUE:
+        BSBW    DP_VCI_REQUEUE_ACTIVE_RCV
+DP_VCI_DECODE_RETURN:
+        RSB
+
+DP_VCI_REQUEUE_ACTIVE_RCV:
+        MOVL    DPCB_L_VCI_ACTIVE_RCV(R6),R2
+        BEQL    20$
+        CLRL    DPCB_L_VCI_ACTIVE_RCV(R6)
+        CLRL    VCRP$A_DEALLOC_RTN(R2)
+        CLRQ    VCRP$Q_CREATOR_DATA(R2)
+        INSQUE  (R2),@DPCB_L_VCI_RCVQ_BL(R6)
+20$:    MOVL    DPCB_L_TEMPLATE_UCB(R6),R3
+        RSB
+.ENDC
+
+; Restore the executive registers after either a direct STARTIO or an
+; asynchronous queued request.  The contexts use separate tail fields because
+; releasing a direct owner can schedule the embedded FKB for a waiter.  R0/R1
+; carry the IOSB pair, R3 is the request UCB, and R5 is set by the caller
+; immediately before REQCOM; use only R2 as a temporary and restore R6 last so
+; the DPCB remains addressable for every preceding load.
+
+DP_RESTORE_FORK_REGS:
+        BBC     #DP_CONTROLLER_V_START_ACTIVE,DPCB_L_FLAGS(R6),50$
+        BICL    #DP_CONTROLLER_M_START_ACTIVE,DPCB_L_FLAGS(R6)
+        MOVL    R6,R2
+        MOVL    DPCB_L_START_R7(R2),R7
+        MOVL    DPCB_L_START_R8(R2),R8
+        MOVL    DPCB_L_START_R9(R2),R9
+        MOVL    DPCB_L_START_R10(R2),R10
+        MOVL    DPCB_L_START_R11(R2),R11
+        MOVL    DPCB_L_START_R6(R2),R6
+        RSB
+50$:    BBC     #DP_CONTROLLER_V_FORK_ACTIVE,DPCB_L_FLAGS(R6),90$
+        BICL    #DP_CONTROLLER_M_FORK_ACTIVE,DPCB_L_FLAGS(R6)
+        MOVL    R6,R2
+        MOVL    DPCB_L_FORK_R7(R2),R7
+        MOVL    DPCB_L_FORK_R8(R2),R8
+        MOVL    DPCB_L_FORK_R9(R2),R9
+        MOVL    DPCB_L_FORK_R10(R2),R10
+        MOVL    DPCB_L_FORK_R11(R2),R11
+        MOVL    DPCB_L_FORK_R6(R2),R6
+90$:    RSB
+
+; R1 = requested payload length.  Returns an eight-byte-aligned R2 payload,
+; R1 = allocated block length, and a VMS status in R0.  EXE$DEANONPAGED reads
+; DYN$W_SIZE at +8 and DYN$B_TYPE at +10, so the user payload must not overlap
+; the standard DYN header.  Four additional bytes keep the payload aligned.
+
+DP_ALLOC_POOL:
+        ADDL    #DP_POOL_HEADER_LENGTH,R1
+        CMPL    R1,#FKB$C_LENGTH
+        BGEQ    10$
+        MOVL    #FKB$C_LENGTH,R1
+10$:    PUSHL   R1
+        PUSHL   R3
+        JSB     G^EXE$ALONONPAGED
+        POPL    R3
+        BLBC    R0,80$
+        ADDL    #4,SP
+        PUSHR   #^M<R0,R1,R2,R3,R4,R5>
+        MOVC5   #0,.,#0,R1,(R2)
+        POPR    #^M<R0,R1,R2,R3,R4,R5>
+        MOVW    R1,DP_DYN_W_SIZE(R2)
+        MOVB    #DYN$C_MISC,DP_DYN_B_TYPE(R2)
+        ADDL    #DP_POOL_HEADER_LENGTH,R2
+        BRB     90$
+80$:    POPL    R1
+90$:    RSB
+
+DP_END:
+        .END

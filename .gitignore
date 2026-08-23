@@ -1,0 +1,12 @@
+*.OBJ
+*.EXE
+*.LIS
+*.MAP
+*.LOG
+*.DIA
+*.DMP
+*.ISO
+*.RAR
+*.iso
+*.rar
+/listings/
