@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 chatgpt5.6-sol and mlevitin.
+ * SPDX-License-Identifier: MIT
+ */
+
 #include <descrip.h>
 #include <iodef.h>
 #include <starlet.h>

@@ -1,4 +1,7 @@
-; XQA0:/QE0 image with a privileged reversible public VCI hook.  V0.58 still
-; makes no callback-table change until its exact control QIO is issued.
+; Copyright (c) 2026 chatgpt5.6-sol and mlevitin.
+; SPDX-License-Identifier: MIT
+;
+; Build an XQA0:/QE0 image with a privileged, reversible public VCI hook.
+; No callback-table change occurs until the exact control QIO is issued.
 DP$TCPIP_ALIAS = 1
 DP$VCI_FRONTEND = 1

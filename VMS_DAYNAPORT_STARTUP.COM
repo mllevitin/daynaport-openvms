@@ -1,4 +1,6 @@
 $! Prepare the experimental V0.61 DaynaPORT LAN device for TCP/IP Services.
+$! Copyright (c) 2026 chatgpt5.6-sol and mlevitin.
+$! SPDX-License-Identifier: MIT
 $! Preferred boot order:
 $!   @SYS$MANAGER:DAYNAPORT_STARTUP.COM
 $!   @SYS$STARTUP:TCPIP$STARTUP.COM

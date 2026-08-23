@@ -2,12 +2,12 @@
         .IDENT  /V0.61/
 ;
 ; Copyright (c) 2026 chatgpt5.6-sol and mlevitin.
-; Licensed under the MIT License.  See LICENSE in the project root.
+; SPDX-License-Identifier: MIT
 ;
-; Early bring-up SCSI class driver for the DaynaPORT SCSI/Link protocol.
-; V0.61 keeps the SETMODE/SENSEMODE port lifecycle and serialized cloned-port
-; requests from V0.11, adds process-context buffered receive completion, and
-; preserves the executive's R6--R11 across both direct and forked STARTIO.
+; Experimental SCSI class driver for the DaynaPORT SCSI/Link protocol.
+; The driver implements the SETMODE/SENSEMODE port lifecycle, serialized
+; cloned-port requests, process-context buffered receive completion, and
+; preservation of the executive's R6--R11 across direct and forked STARTIO.
 ; When assembled with DP$TCPIP_ALIAS defined, the same implementation exposes
 ; an XQA0:/QE0 compatibility name for TCP/IP Services while still addressing
 ; DaynaPORT target 4, LUN 0.  It does not emulate DELQA hardware.
@@ -23,9 +23,9 @@
 ; them so sustained TCP traffic cannot starve inbound acknowledgements.  Each
 ; nonempty receive also requests one immediate follow-up READ, draining bursts
 ; to empty without increasing the idle 10-ms poll rate.
-; The rejected post-WRITE holdoff experiment is removed.  Passive ICMP echo
-; request/reply telemetry now distinguishes an upper transmit, successful SCSI
-; completion, lower receive, and VCI delivery without changing packet handling.
+; Passive ICMP echo request/reply telemetry distinguishes an upper transmit,
+; successful SCSI completion, lower receive, and VCI delivery without changing
+; packet handling.
 ; The first DaynaPORT command remains deferred until STARTIO.  OpenVMS VAX
 ; V7.3 does not provide a resumable SPI command context to a class driver's
 ; UNIT_INIT routine.  It also reconstructs the shared-controller register from
@@ -779,8 +779,8 @@ DP_UNIT_INIT:
         MOVL    R4,UCB$L_PDT(R5)
 
 ; Do not issue an SPI command from UNIT_INIT.  The installed VAX V7.3
-; GKDRIVER establishes the port connection here but performs no SPI I/O, and
-; a live V0.6 test proved that SPI$SEND_COMMAND cannot resume this context.
+; GKDRIVER establishes the port connection here but performs no SPI I/O.
+; SPI$SEND_COMMAND cannot resume this UNIT_INIT context on OpenVMS VAX V7.3.
 ; The first STARTIO request reads and caches the fixed hardware address before
 ; dispatching its operation.  A normal LAN client starts its port before
 ; issuing SENSEMODE, so that request also supplies the initialization context.
@@ -788,8 +788,8 @@ DP_UNIT_INIT:
         BISL    #DP_CONTROLLER_M_READY,DPCB_L_FLAGS(R6)
         BISW    #UCB$M_ONLINE,UCB$W_STS(R5)
 .IF DEFINED DP$VCI_FRONTEND
-; Capture only.  DP_VCI_CAPTURE never writes the live LAN block.  V0.24 can
-; interpose callbacks later only through its privileged STARTIO control path.
+; Capture only.  DP_VCI_CAPTURE never writes the live LAN block.  Callback
+; interposition occurs later only through the privileged STARTIO control path.
         BSBW    DP_VCI_CAPTURE
         MOVZWL  #SS$_NORMAL,R0
 .ENDC
@@ -1096,7 +1096,7 @@ DP_VCI_GET_DEVICE:
 ; Identify only the documented DLL$K_LAN_DEVICE item containing an exact
 ; three-character counted XQA name.  Every absent, unknown, entity-based, or
 ; malformed case is forwarded to the resident create routine unchanged.
-; An exact XQA request reaches the V0.28 clone helper.  That helper fails closed
+; An exact XQA request reaches the clone helper.  That helper fails closed
 ; until the controller is ready, a normal STARTIO request has cached its MAC,
 ; and the lower-owned receive pool has reached its documented minimum.
 
@@ -1170,7 +1170,7 @@ DP_VCI_DELETE_PORT:
 90$:    MOVZWL  #SS$_NOSUCHDEV,R0
         RSB
 
-; V0.28 clone contract recovered from the resident VAX LAN implementation.
+; Clone contract for the legacy VAX LAN callback interface.
 ; MAC_VALID is deliberately stronger than READY: SPI$SEND_COMMAND cannot
 ; resume from UNIT_INIT on this target, so startup must first issue the proven
 ; bounded DEACCESS primer through ordinary STARTIO before LAN creates XQA.
@@ -2774,7 +2774,7 @@ DP_PARSE_SET_ATTRIBUTES:
         SUBL    #<DP_NMA_STRING_OVERHEAD+2+DP_NMA_ADDRESS_LENGTH>,R7
         BRW     DP_PARSE_SET_ATTRIBUTES
 
-; The request is retained even though V0.40 does not yet synthesize the LAN
+; The request is retained even though the driver does not synthesize the LAN
 ; common layer's automatic port-restart sequence after an adapter failure.
 ; Accept only ENABLE so the stored state cannot claim any unsupported variant.
 
@@ -3642,8 +3642,8 @@ DP_SPI_EXPOSE_EXEC_REGS:
 ; A suspended SPI command resumes in a newly dispatched completion fork.  The
 ; old fork was already dismissed with the register image exposed above.  Save
 ; the live completion-fork image before the driver reclaims R6--R11; returning
-; the old image here corrupts whichever executive thread the SCSI completion
-; interrupted (the V0.46 dump demonstrated this with an F11 XQP base in R10).
+; the old image here can corrupt whichever executive thread the SCSI completion
+; interrupted.
 
 DP_SPI_CAPTURE_RESUME_REGS:
         MOVL    UCB_L_DP_CONTROLLER(R3),R2

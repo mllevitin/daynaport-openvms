@@ -1,4 +1,6 @@
 $! Build DYDRIVER V0.61 and its two required runtime utilities.
+$! Copyright (c) 2026 chatgpt5.6-sol and mlevitin.
+$! SPDX-License-Identifier: MIT
 $! This procedure never installs, loads, connects, or executes an image.
 $ SET NOON
 $ ON CONTROL_Y THEN GOTO ABORTED

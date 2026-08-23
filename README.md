@@ -12,10 +12,11 @@ FTP, but it has not been qualified for production use.
 ## Authorship
 
 The driver and the supporting code in this repository were written entirely
-by OpenAI Codex in collaboration with the repository owner. The owner defined
-the goal and constraints, provided and operated the hardware, participated in
-architecture decisions, supplied observations from the physical consoles and
-packet captures, and performed hands-on parts of the live test program.
+by OpenAI Codex (`chatgpt5.6-sol`) in collaboration with `mlevitin`. The
+repository owner defined the goal and constraints, provided and operated the
+hardware, participated in architecture decisions, supplied observations from
+the physical consoles and packet captures, and performed hands-on parts of the
+live test program.
 
 ## Development environment
 

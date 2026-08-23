@@ -1,0 +1,6 @@
+* text=auto
+
+*.md text eol=lf
+*.c text eol=lf
+*.MAR text eol=lf linguist-language=Assembly
+*.COM text eol=lf linguist-language=DCL
