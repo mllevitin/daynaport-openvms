@@ -1,4 +1,4 @@
-$! Build DYDRIVER V0.62 and its two required runtime utilities.
+$! Build DYDRIVER V0.68 and its required runtime control utility.
 $! Copyright (c) 2026 chatgpt5.6-sol and mlevitin.
 $! SPDX-License-Identifier: MIT
 $! This procedure never installs, loads, connects, or executes an image.
@@ -21,12 +21,6 @@ $
 $ ANALYZE/IMAGE DYDRIVER.EXE
 $ IF .NOT. $STATUS THEN GOTO FAILED
 $
-$ WRITE SYS$OUTPUT "Compiling DP_MAC_INIT ..."
-$ CC/STANDARD=VAXC/OBJECT=DP_MAC_INIT.OBJ [.SRC]DP_MAC_INIT.C
-$ IF .NOT. $STATUS THEN GOTO FAILED
-$ LINK/EXE=DP_MAC_INIT.EXE DP_MAC_INIT.OBJ
-$ IF .NOT. $STATUS THEN GOTO FAILED
-$
 $ WRITE SYS$OUTPUT "Compiling DP_VCI_CONTROL ..."
 $ CC/STANDARD=VAXC/OBJECT=DP_VCI_CONTROL.OBJ [.SRC]DP_VCI_CONTROL.C
 $ IF .NOT. $STATUS THEN GOTO FAILED
@@ -35,7 +29,6 @@ $ IF .NOT. $STATUS THEN GOTO FAILED
 $
 $ WRITE SYS$OUTPUT "DaynaPORT build completed:"
 $ WRITE SYS$OUTPUT "  DYDRIVER.EXE"
-$ WRITE SYS$OUTPUT "  DP_MAC_INIT.EXE"
 $ WRITE SYS$OUTPUT "  DP_VCI_CONTROL.EXE"
 $ WRITE SYS$OUTPUT "No image was installed, loaded, connected, or run."
 $ GOTO DONE

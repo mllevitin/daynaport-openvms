@@ -17,7 +17,6 @@ The release build needs these project files:
 ```text
 driver/DPDRIVER.MAR
 driver/DYDRIVER_VCI_PREFIX.MAR
-src/dp_mac_init.c
 src/dp_vci_control.c
 VMS_BUILD.COM
 VMS_DAYNAPORT_STARTUP.COM
@@ -53,7 +52,6 @@ $ @VMS_BUILD.COM
 
 ```text
 DYDRIVER.EXE
-DP_MAC_INIT.EXE
 DP_VCI_CONTROL.EXE
 ```
 
@@ -76,10 +74,10 @@ reports no image error.
 
 ## Prebuilt PCSI installation
 
-The verified V0.62 artifact is:
+The verified V0.68 artifact is:
 
 ```text
-dist/CHATGPT56-VAXVMS-DAYNAPORT-V0062--1.PCSI
+dist/CHATGPT56-VAXVMS-DAYNAPORT-V0068--1.PCSI
 ```
 
 It is 40960 bytes. Verify its SHA-256 against `dist/SHA256SUMS`, transfer the
@@ -94,7 +92,6 @@ The full kit installs these components:
 
 ```text
 SYS$LOADABLE_IMAGES:DYDRIVER.EXE
-SYS$STARTUP:DP_MAC_INIT.EXE
 SYS$STARTUP:DP_VCI_CONTROL.EXE
 SYS$STARTUP:DAYNAPORT$STARTUP.COM
 SYS$TEST:DAYNAPORT$IVP.COM
@@ -102,15 +99,15 @@ SYS$HELP:DAYNAPORT$INSTALL.TXT
 SYS$HELP:DAYNAPORT$LICENSE.TXT
 ```
 
-Its IVP checks the installed files and runs `ANALYZE/IMAGE` on the three
+Its IVP checks the installed files and runs `ANALYZE/IMAGE` on the two
 images. It never loads, connects, or executes the driver. PCSI does not set
 `USER4`, configure QE0, or edit `SYSTARTUP_VMS.COM`; perform those
 node-specific steps only after reading the installed administrator guide.
 
-V0.62 was packaged with PCSI V7.3-100 and successfully upgraded an installed
-V0.61 full product. The V0.62 common image and both support images passed the
-automatic and manual IVPs with zero image errors. The upgrade did not reload
-the active node-specific driver.
+V0.68 was packaged with PCSI V7.3-100 on the validated OpenVMS VAX V7.3
+system and upgraded an installed V0.62 product. The automatic and manual IVPs
+passed. An orderly reboot then loaded the kit image and brought XQA0 and QE0
+online with zero device errors.
 
 ## USER4 configuration
 
@@ -175,16 +172,15 @@ $ COPY DYDRIVER.EXE SYS$LOADABLE_IMAGES:DYDRIVER.EXE
 $ ANALYZE/IMAGE SYS$LOADABLE_IMAGES:DYDRIVER.EXE
 ```
 
-Keep the startup procedure and both support images in the same directory,
+Keep the startup procedure and control utility in the same directory,
 normally `SYS$MANAGER:`:
 
 ```text
-$ COPY DP_MAC_INIT.EXE SYS$MANAGER:
 $ COPY DP_VCI_CONTROL.EXE SYS$MANAGER:
 $ COPY VMS_DAYNAPORT_STARTUP.COM SYS$MANAGER:DAYNAPORT_STARTUP.COM
 ```
 
-The startup procedure locates the two support images beside itself.
+The startup procedure locates the control utility beside itself.
 
 ## Configure TCP/IP Services
 
@@ -236,12 +232,11 @@ DYDRIVER must be the sole class-driver owner of target 4, LUN 0.
 
 `DAYNAPORT_STARTUP.COM`:
 
-1. verifies that `SYS$LOADABLE_IMAGES:DYDRIVER.EXE` and both support images
+1. verifies that `SYS$LOADABLE_IMAGES:DYDRIVER.EXE` and the control utility
    exist;
 2. runs `SYSGEN CONNECT XQA0:/NOADAPTER/DRIVER=DYDRIVER` if XQA0 is absent;
-3. runs `DP_MAC_INIT XQA0:` to cache the hardware address while
-   the interface is disabled;
-4. runs `DP_VCI_CONTROL INSTALL XQA0:` to publish the guarded wrapper set;
+3. runs `DP_VCI_CONTROL INSTALL XQA0:`; the driver caches the hardware
+   address in ordinary STARTIO and then publishes the guarded wrapper set;
 5. returns for normal `TCPIP$STARTUP`;
 6. if TCP/IP is already running, starts an absent QE0 with DHCP.
 
@@ -258,8 +253,7 @@ Expected startup messages include:
 
 ```text
 Connecting XQA0 to DYDRIVER ...
-Priming the DaynaPORT hardware address ...
-Installing the VCI discovery hook ...
+Caching the DaynaPORT MAC and installing the VCI hook ...
 DaynaPORT is prepared; TCPIP$STARTUP will activate persistent QE0/DHCP.
 ```
 

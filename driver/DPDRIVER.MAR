@@ -1,13 +1,30 @@
         .TITLE  DPDRIVER - DaynaPORT SCSI transport for OpenVMS VAX
-        .IDENT  /V0.62/
+        .IDENT  /V0.68/
 ;
-; Copyright (c) 2026.
+; Copyright (c) 2026 chatgpt5.6-sol and mlevitin.
+; Licensed under the MIT License; see LICENSE in the repository root.
+; SPDX-License-Identifier: MIT
 ;
-; Early bring-up SCSI class driver for the DaynaPORT SCSI/Link protocol.
-; V0.62 is the native-PCSI packaging release.  It keeps the V0.61 packet-I/O
-; implementation unchanged: SETMODE/SENSEMODE port lifecycle, serialized
-; cloned-port requests, process-context buffered receive completion, and
-; preservation of the executive's R6--R11 across direct and forked STARTIO.
+; SCSI class driver for the DaynaPORT SCSI/Link protocol.
+; V0.68 bypasses the chain-copy helper at both transmit call sites when the
+; VCRP is contiguous; the helper retains its own fail-safe fast return for
+; independent callers.  V0.67 returns before the large register save in the
+; common contiguous-VCRP
+; validation and copy paths.  Chained frames retain the complete V0.65 checks
+; and coalescing logic.  V0.66 removes a redundant per-frame MAC-cache check
+; from both VCI transmit workers.  Hook installation and port creation
+; already require MAC_VALID, and that controller-lifetime flag is never
+; cleared.  The ordinary STARTIO
+; primer remains the only safe first-MAC path.  V0.65 adds bounded multi-DCBE
+; transmit coalescing, including VAX
+; SVAPTE/BOFF descriptors mapped through four private system PTEs.  The
+; serialized IOLOCK8 worker owns that single mapping window and can therefore
+; advertise the general transmit-chaining contract.  V0.63 validates
+; the completed SCSI write byte count before reporting an Ethernet transmit
+; success and records the last actual count plus the number of incomplete
+; writes.  It otherwise retains the V0.62 SETMODE/SENSEMODE
+; lifecycle, serialized cloned-port requests, process-context buffered receive
+; completion, and executive R6--R11 preservation.
 ; When assembled with DP$TCPIP_ALIAS defined, the same implementation exposes
 ; an XQA0:/QE0 compatibility name for TCP/IP Services while still addressing
 ; DaynaPORT target 4, LUN 0.  It does not emulate DELQA hardware.
@@ -18,7 +35,8 @@
 ; after an ordinary STARTIO request has cached the hardware address.  The clone
 ; carries typed asynchronous VCRP
 ; ownership, SCSI-backed port management, bounded VCI transmit coalescing, and a
-; timer-paced persistent receive path whose TQE runs only while a port is active.
+; timer-paced persistent receive path whose TQE runs only while a port is
+; active.
 ; When transmit and receive work are both pending, the controller alternates
 ; them so sustained TCP traffic cannot starve inbound acknowledgements.  Each
 ; nonempty receive also requests one immediate follow-up READ, draining bursts
@@ -70,10 +88,13 @@
         $IRPDEF
         $NMADEF
         $PCBDEF
+        $PRDEF
         $PRVDEF
+        $PTEDEF
         $SCDRPDEF
         $SSDEF
         $UCBDEF
+        $VADEF
         $VECDEF
 
 .IF DEFINED DP$VCI_FRONTEND
@@ -116,6 +137,12 @@ DP_RX_RAW_OFFSET        = 16
 DP_RX_BUFFER_LENGTH     = DP_RX_RAW_OFFSET+DP_RX_MAX
 DP_TX_MIN               = 60
 DP_TX_MAX               = 1514
+DP_VAX_PAGE_SIZE        = 512
+DP_VAX_PAGE_MASK        = DP_VAX_PAGE_SIZE-1
+DP_VAX_PAGE_SHIFT       = 9
+DP_VAX_PTE_SIZE         = 4
+; A 1514-byte segment beginning at byte 511 spans at most four VAX pages.
+DP_VCI_MAP_PAGES        = 4
 DP_MAC_REPLY_LENGTH     = 18
 DP_NMA_SET_MAX          = 512
 DP_VCI_P2_SNAPSHOT_MAX = 72
@@ -232,7 +259,7 @@ DP_OP_INTERFACE         = ^X0E
 DP_READ_SINGLE          = ^X80
 DP_INTERFACE_ENABLE     = ^X80
 
-; Bring-up breadcrumbs exposed through UCB$L_DEVDEPEND/DEVDEPND2.  They let
+; Diagnostic state exposed through UCB$L_DEVDEPEND/DEVDEPND2.  It lets
 ; SDA distinguish dispatch, buffer mapping, and command submission failures
 ; without logging from interrupt context.
 
@@ -243,14 +270,13 @@ DP_STAGE_SENT           = 3
         .IIF NDF DT$_GENERIC_SCSI, DT$_GENERIC_SCSI = 5
         .IIF NDF DPT$M_NO_IDB_DISPATCH, DPT$M_NO_IDB_DISPATCH = ^X1000
         .IIF NDF DPT$M_CSMACD, DPT$M_CSMACD = ^X8000
-; The installed VAX V7.3 $DYNDEF omits the SCSI-private pool type.  The V7.3
-; SCSI source listings define the SCDRP dynamic type as decimal 93.
+; The installed VAX V7.3 $DYNDEF omits the SCSI-private pool type.  The
+; platform ABI uses decimal 93 for the SCDRP dynamic type.
         .IIF NDF DYN$C_SCDRP, DYN$C_SCDRP = 93
 ; VAX V7.3 $DYNDEF does not export generic DYN$W_SIZE/DYN$B_TYPE field
-; symbols.  The local offsets above are confirmed both by the TQE listings and
-; by live EXE$DEANONPAGED disassembly; their encoded operands are checked in
-; the native listing.
-; VAX V7.3 uses the original SCDRP flag names; later listings renamed them.
+; symbols.  The local offsets above match the VAX V7.3 ABI and are guarded by
+; assembler assumptions at every use.
+; VAX V7.3 uses the original SCDRP flag names.
         .IIF NDF SCDRP$M_S0BUF, SCDRP$M_S0BUF = SCDRP$M_FLAG_S0BUF
         .IIF NDF SCDRP$V_S0BUF, SCDRP$V_S0BUF = SCDRP$V_FLAG_S0BUF
 
@@ -341,6 +367,14 @@ $DEF    DPCB_L_VCI_CHAIN_SEEN   .BLKL   1
 $DEF    DPCB_L_VCI_CHAIN_MODE   .BLKL   1
 $DEF    DPCB_L_VCI_CHAIN_BCNT   .BLKL   1
 $DEF    DPCB_L_VCI_CHAIN_STATUS .BLKL   1
+$DEF    DPCB_L_VCI_CHAIN_SEGMENTS .BLKL 1
+$DEF    DPCB_L_VCI_CHAIN_SVA_SEGMENTS .BLKL 1
+$DEF    DPCB_L_VCI_CHAIN_PTE_SEGMENTS .BLKL 1
+$DEF    DPCB_L_VCI_MAP_SVAPTE   .BLKL   1
+$DEF    DPCB_L_VCI_MAP_SVA      .BLKL   1
+$DEF    DPCB_L_VCI_MAP_COUNT    .BLKL   1
+$DEF    DPCB_L_VCI_MAP_USE_COUNT .BLKL  1
+$DEF    DPCB_L_VCI_MAP_TRANSLATE_COUNT .BLKL 1
 $DEF    DPCB_L_VCI_TX_ENTRY_COUNT .BLKL 1
 $DEF    DPCB_L_VCI_TX_QUEUE_COUNT .BLKL 1
 $DEF    DPCB_L_VCI_TX_COMPLETE_COUNT .BLKL 1
@@ -348,6 +382,8 @@ $DEF    DPCB_L_VCI_TX_STATUS    .BLKL   1
 $DEF    DPCB_L_VCI_TX_STATUS2   .BLKL   1
 $DEF    DPCB_L_VCI_TX_LAST_BCNT .BLKL   1
 $DEF    DPCB_L_VCI_TX_LAST_TOTAL .BLKL  1
+$DEF    DPCB_L_VCI_TX_LAST_TRANSFER .BLKL 1
+$DEF    DPCB_L_VCI_TX_SHORT_COUNT .BLKL 1
 $DEF    DPCB_L_VCI_TX_ICMP_SEEN  .BLKL   1
 $DEF    DPCB_L_VCI_TX_ICMP_COMPLETE .BLKL 1
 $DEF    DPCB_L_VCI_TX_ICMP_IDSEQ .BLKL   1
@@ -778,6 +814,27 @@ DP_UNIT_INIT:
 20$:    MOVL    R2,DPCB_L_SCDT(R6)
         MOVL    R4,DPCB_L_PDT(R6)
         MOVL    R4,UCB$L_PDT(R5)
+
+.IF DEFINED DP$VCI_FRONTEND
+; LDR$ALLOC_PT returns the address of the first system PTE in R1 and preserves
+; the requested count in R2.  The VCI transmit worker is serialized by the
+; IOLOCK8 fork lock, so one four-page window is sufficient for every port on
+; this controller.  No SCSI command is issued here.
+
+        MOVL    #DP_VCI_MAP_PAGES,R2
+        JSB     G^LDR$ALLOC_PT
+        BLBS    R0,21$
+        BRW     90$
+21$:    MOVL    R1,DPCB_L_VCI_MAP_SVAPTE(R6)
+        MOVL    R2,DPCB_L_VCI_MAP_COUNT(R6)
+; On VAX a PTE is four bytes and a page is 512 bytes, hence a byte offset in
+; the system page table is shifted left by seven to obtain its virtual-address
+; offset.  Set the system-space bit after the conversion.
+        SUBL3   G^MMG$GL_SPTBASE,R1,R0
+        ASHL    #<DP_VAX_PAGE_SHIFT-2>,R0,R0
+        BISL    #VA$M_SYSTEM,R0
+        MOVL    R0,DPCB_L_VCI_MAP_SVA(R6)
+.ENDC
 
 ; Do not issue an SPI command from UNIT_INIT.  The installed VAX V7.3
 ; GKDRIVER establishes the port connection here but performs no SPI I/O, and
@@ -1268,6 +1325,8 @@ DP_VCI_CLONE_PORT:
 ; The installed VAX V7.3 VCIBDLL layout reserves +128..+139.  Unlike the
 ; Alpha V7.3 layout, it exports no LAN reset callback, and the resident VAX
 ; LAN initializer leaves those bytes untouched.
+; The serialized worker supports direct-SVA and SVAPTE/BOFF DCBE segments and
+; validates the complete chain before taking ownership of the VCRP.
         MOVW    #VCIB$M_DLL_XMT_CHAIN,VCIB$W_DLL_FLAGS(R4)
         MOVW    #VCIB$K_DLL_CSMACD,VCIB$W_DLL_TYPE(R4)
         MOVW    #DP_ETH_HEADER,VCIB$W_DLL_HDR_SIZE(R4)
@@ -1413,8 +1472,8 @@ DP_VCI_FILL_RECEIVE_POOL:
 ; called with the controller's IOLOCK8 fork lock held after a successful VCI
 ; ENABLE.  The target
 ; definitions are VAX-specific: TQE length 0x34, FR3 at 0x10, TIME at 0x18,
-; and DELTA at 0x20.  The installed layout probe references every field used
-; here so an incompatible target fails the native build gate.
+; and DELTA at 0x20.  Assembler assumptions guard the fields used here so an
+; incompatible target fails the native build.
 
 DP_VCI_START_POLLER:
         PUSHR   #^M<R0,R1,R2,R3,R4,R5>
@@ -1526,7 +1585,7 @@ DP_VCI_RETURN_RECEIVE:
 ; Build-only VCI port-management state machine.  The public callback runs at
 ; FLCK with R3 = VCRP and R4 = VCIB and may destroy only R0/R1.  Preserve the
 ; remaining registers explicitly, including R3 because the upper completion
-; callback is documented by the resident LAN listing as destroying it.
+; callback contract permits it to be destroyed.
 ;
 ; ENABLE accepts the same exclusive-Ethernet scalar P2 subset as the public
 ; SETMODE path and commits it transactionally.  CHANGE accepts an empty no-op
@@ -1848,6 +1907,93 @@ DP_VCI_BUILD_HDR:
         POPL    R5
         RSB
 
+; Validate the complete transmit layout before the lower driver takes VCRP
+; ownership.  R3 is the VCRP, R6 the controller, R7 the embedded byte count,
+; and R11 the total PDU byte count.  A DCBE must describe a nonempty direct-SVA
+; or SVAPTE/BOFF segment.  The running byte total bounds even a corrupt cyclic
+; list, while the explicit segment limit is a second fail-closed guard.
+;
+; Output: R0 = status.  All other registers are preserved.
+
+DP_VCI_VALIDATE_TX_CHAIN:
+        TSTL    VCRP$A_DCB_LINK(R3)
+        BNEQ    2$
+        CMPL    R7,R11
+        BNEQ    1$
+        MOVZWL  #SS$_NORMAL,R0
+        RSB
+1$:     MOVZWL  #SS$_BADPARAM,R0
+        RSB
+2$:
+        PUSHR   #^M<R2,R3,R4,R5,R7,R8,R9,R10,R11>
+        MOVL    R7,R9
+        MOVL    VCRP$A_DCB_LINK(R3),R10
+        INCL    DPCB_L_VCI_CHAIN_SEEN(R6)
+        CLRL    DPCB_L_VCI_CHAIN_MODE(R6)
+        CLRL    DPCB_L_VCI_CHAIN_BCNT(R6)
+        CLRL    DPCB_L_VCI_CHAIN_SEGMENTS(R6)
+        CLRL    DPCB_L_VCI_CHAIN_SVA_SEGMENTS(R6)
+        CLRL    DPCB_L_VCI_CHAIN_PTE_SEGMENTS(R6)
+        MOVZWL  #SS$_BADPARAM,R0
+        MOVL    R0,DPCB_L_VCI_CHAIN_STATUS(R6)
+        CLRL    R2
+        CLRL    R4
+        CLRL    R5
+
+20$:    INCL    R2
+        CMPL    R2,#DP_TX_MAX
+        BLEQU   21$
+        BRW     91$
+21$:    MOVL    DCBE$L_BCNT(R10),R8
+        BNEQ    22$
+        BRW     91$
+22$:    ADDL2   R8,R9
+        BCC     23$
+        BRW     91$
+23$:    CMPL    R9,R11
+        BLEQU   24$
+        BRW     91$
+24$:    TSTL    DCBE$L_BUFFER_ADDRESS(R10)
+        BEQL    25$
+        INCL    R4
+        BRW     27$
+25$:    TSTL    DCBE$L_SVAPTE(R10)
+        BNEQ    26$
+        BRW     91$
+26$:    INCL    R5
+27$:    MOVL    DCBE$A_DCB_LINK(R10),R10
+        BEQL    28$
+        BRW     20$
+28$:
+
+        CMPL    R9,R11
+        BEQL    30$
+        BRW     91$
+30$:    MOVL    R2,DPCB_L_VCI_CHAIN_SEGMENTS(R6)
+        MOVL    R4,DPCB_L_VCI_CHAIN_SVA_SEGMENTS(R6)
+        MOVL    R5,DPCB_L_VCI_CHAIN_PTE_SEGMENTS(R6)
+        SUBL3   R7,R11,DPCB_L_VCI_CHAIN_BCNT(R6)
+        CMPL    R2,#1
+        BEQL    31$
+        MOVL    #DP_VCI_CHAIN_MULTIPLE,DPCB_L_VCI_CHAIN_MODE(R6)
+        BRW     32$
+31$:    TSTL    R5
+        BEQL    311$
+        MOVL    #DP_VCI_CHAIN_SVAPTE,DPCB_L_VCI_CHAIN_MODE(R6)
+        BRW     32$
+311$:   MOVL    #DP_VCI_CHAIN_SVA,DPCB_L_VCI_CHAIN_MODE(R6)
+32$:    MOVZWL  #SS$_NORMAL,R0
+        MOVL    R0,DPCB_L_VCI_CHAIN_STATUS(R6)
+        BRW     95$
+
+91$:    MOVL    R2,DPCB_L_VCI_CHAIN_SEGMENTS(R6)
+        MOVL    R4,DPCB_L_VCI_CHAIN_SVA_SEGMENTS(R6)
+        MOVL    R5,DPCB_L_VCI_CHAIN_PTE_SEGMENTS(R6)
+        MOVZWL  #SS$_BADPARAM,R0
+        MOVL    R0,DPCB_L_VCI_CHAIN_STATUS(R6)
+95$:    POPR    #^M<R2,R3,R4,R5,R7,R8,R9,R10,R11>
+        RSB
+
 ; TRANSMIT_FRAME receives a complete Ethernet frame whose static header was
 ; normally produced by DP_VCI_BUILD_HDR.  The destination address is still a
 ; per-request field in VCRP$Q_LAN_T_DEST.  Tag the owned request temporarily
@@ -1944,45 +2090,9 @@ DP_VCI_TRANSMIT_FRAME:
         CMPL    R8,R9
         BLEQU   28$
         BRW     DP_VCI_TRANSMIT_FRAME_BADPARAM
-28$:    MOVL    VCRP$A_DCB_LINK(R3),R10
-        BNEQ    281$
-        CMPL    R7,R11
-        BNEQ    280$
-        BRW     29$
-280$:
+28$:    BSBW    DP_VCI_VALIDATE_TX_CHAIN
+        BLBS    R0,29$
         BRW     DP_VCI_TRANSMIT_FRAME_BADPARAM
-
-; VAX V7.3 CSMACD promises at most one additional DCBE.  Direct system
-; virtual addresses are coalesced by the worker.  A page-table descriptor is
-; recognized and rejected without dereferencing it until this driver owns a
-; preallocated system-PTE mapping window equivalent to LAN$SETUP_PTE's LSB.
-
-281$:   INCL    DPCB_L_VCI_CHAIN_SEEN(R6)
-        CLRL    DPCB_L_VCI_CHAIN_MODE(R6)
-        MOVL    DCBE$L_BCNT(R10),R8
-        MOVL    R8,DPCB_L_VCI_CHAIN_BCNT(R6)
-        MOVZWL  #SS$_BADPARAM,R0
-        MOVL    R0,DPCB_L_VCI_CHAIN_STATUS(R6)
-        TSTL    DCBE$A_DCB_LINK(R10)
-        BEQL    282$
-        MOVL    #DP_VCI_CHAIN_MULTIPLE,DPCB_L_VCI_CHAIN_MODE(R6)
-        BRW     DP_VCI_FRAME_UNSUPPORTED
-282$:   TSTL    R8
-        BEQL    284$
-        TSTL    DCBE$L_BUFFER_ADDRESS(R10)
-        BNEQ    283$
-        MOVL    #DP_VCI_CHAIN_SVAPTE,DPCB_L_VCI_CHAIN_MODE(R6)
-        BRW     DP_VCI_FRAME_UNSUPPORTED
-283$:   MOVL    #DP_VCI_CHAIN_SVA,DPCB_L_VCI_CHAIN_MODE(R6)
-284$:   ADDL3   R7,R8,R9
-        BCC     285$
-        BRW     DP_VCI_TRANSMIT_FRAME_BADPARAM
-285$:   CMPL    R9,R11
-        BEQL    286$
-        BRW     DP_VCI_TRANSMIT_FRAME_BADPARAM
-286$:   MOVZWL  #SS$_NORMAL,R0
-        MOVL    R0,DPCB_L_VCI_CHAIN_STATUS(R6)
-
 29$:    INCL    DPCB_L_VCI_TX_QUEUE_COUNT(R6)
         MOVL    R5,VCRP$A_LAN_UCB(R3)
         BISL    #DP_VCI_M_FRAME,VCRP$L_FUNCTION(R3)
@@ -2011,9 +2121,6 @@ DP_VCI_TRANSMIT_FRAME_NOSUCHDEV:
 DP_VCI_TRANSMIT_FRAME_OFFLINE:
         MOVZWL  #SS$_DEVOFFLINE,R0
         BRW     DP_VCI_TRANSMIT_FRAME_COMPLETE
-DP_VCI_FRAME_UNSUPPORTED:
-        MOVZWL  #SS$_UNSUPPORTED,R0
-        MOVL    R0,DPCB_L_VCI_CHAIN_STATUS(R6)
 DP_VCI_TRANSMIT_FRAME_COMPLETE:
         CLRL    R1
         TSTL    R6
@@ -2029,8 +2136,9 @@ DP_VCI_TRANSMIT_FRAME_RETURN:
         RSB
 
 ; VCI transmit receives user payload in the VCRP and builds the Ethernet
-; header in a controller-owned staging buffer.  One direct-SVA DCBE is
-; accepted and coalesced; SVAPTE or multiple-DCBE requests fail closed.
+; header in a controller-owned staging buffer.  Any validated continuation
+; DCBE chain is coalesced there; direct-SVA and SVAPTE/BOFF segments may be
+; mixed, subject to the frame-size and private mapping-window bounds.
 ; Only R0 and R3 may be destroyed by this public callback.
 
 DP_VCI_TRANSMIT:
@@ -2120,39 +2228,9 @@ DP_VCI_TRANSMIT:
         CMPL    R8,R9
         BLEQU   26$
         BRW     DP_VCI_TRANSMIT_BADPARAM
-26$:    MOVL    VCRP$A_DCB_LINK(R3),R10
-        BNEQ    261$
-        CMPL    R7,R11
-        BNEQ    260$
-        BRW     29$
-260$:
+26$:    BSBW    DP_VCI_VALIDATE_TX_CHAIN
+        BLBS    R0,29$
         BRW     DP_VCI_TRANSMIT_BADPARAM
-261$:   INCL    DPCB_L_VCI_CHAIN_SEEN(R6)
-        CLRL    DPCB_L_VCI_CHAIN_MODE(R6)
-        MOVL    DCBE$L_BCNT(R10),R8
-        MOVL    R8,DPCB_L_VCI_CHAIN_BCNT(R6)
-        MOVZWL  #SS$_BADPARAM,R0
-        MOVL    R0,DPCB_L_VCI_CHAIN_STATUS(R6)
-        TSTL    DCBE$A_DCB_LINK(R10)
-        BEQL    262$
-        MOVL    #DP_VCI_CHAIN_MULTIPLE,DPCB_L_VCI_CHAIN_MODE(R6)
-        BRW     DP_VCI_TRANSMIT_UNSUPPORTED
-262$:   TSTL    R8
-        BEQL    264$
-        TSTL    DCBE$L_BUFFER_ADDRESS(R10)
-        BNEQ    263$
-        MOVL    #DP_VCI_CHAIN_SVAPTE,DPCB_L_VCI_CHAIN_MODE(R6)
-        BRW     DP_VCI_TRANSMIT_UNSUPPORTED
-263$:   MOVL    #DP_VCI_CHAIN_SVA,DPCB_L_VCI_CHAIN_MODE(R6)
-264$:   ADDL3   R7,R8,R9
-        BCC     265$
-        BRW     DP_VCI_TRANSMIT_BADPARAM
-265$:   CMPL    R9,R11
-        BEQL    266$
-        BRW     DP_VCI_TRANSMIT_BADPARAM
-266$:   MOVZWL  #SS$_NORMAL,R0
-        MOVL    R0,DPCB_L_VCI_CHAIN_STATUS(R6)
-
 29$:    INCL    DPCB_L_VCI_TX_QUEUE_COUNT(R6)
         MOVL    R5,VCRP$A_LAN_UCB(R3)
         INCL    VCIB$L_LAN_OOCNT(R4)
@@ -2180,9 +2258,6 @@ DP_VCI_TRANSMIT_NOSUCHDEV:
 DP_VCI_TRANSMIT_OFFLINE:
         MOVZWL  #SS$_DEVOFFLINE,R0
         BRW     DP_VCI_TRANSMIT_COMPLETE
-DP_VCI_TRANSMIT_UNSUPPORTED:
-        MOVZWL  #SS$_UNSUPPORTED,R0
-        MOVL    R0,DPCB_L_VCI_CHAIN_STATUS(R6)
 DP_VCI_TRANSMIT_COMPLETE:
         CLRL    R1
         TSTL    R6
@@ -2695,8 +2770,8 @@ DP_PARSE_SET_ATTRIBUTES:
         BRW     75$
 
 ; TCP/IP Services includes an explicit promiscuous-mode attribute in its VCI
-; ENABLE list.  LAN$VALID_PRM in the V7.3 LAN listing accepts STATE_OFF for a
-; VCI client but rejects STATE_ON.  Validate and consume that harmless scalar;
+; ENABLE list.  The V7.3 LAN contract accepts STATE_OFF for a VCI client but
+; rejects STATE_ON.  Validate and consume that harmless scalar;
 ; do not advertise or enable promiscuous operation for DaynaPORT.
 
 76$:    BITL    #DP_ATTR_M_PRM,R8
@@ -2800,7 +2875,8 @@ DP_PARSE_SET_ATTRIBUTES:
 ; SENSEMODE is an FDT-only operation.  P1 is an optional eight-byte device
 ; characteristics buffer.  P2 is an optional descriptor for the supported
 ; LAN attribute prefix.  The output buffers are consumed synchronously, so
-; the public IFNOWRT probe is sufficient; no LAN-private read-check macro or
+; the public IFNOWRT validation is sufficient; no LAN-private read-check macro
+; or
 ; deferred buffer lock is required.
 
 DP_SENSEMODE_FDT:
@@ -3973,12 +4049,119 @@ DP_VCI_CLASSIFY_TX_ICMP:
 90$:    POPR    #^M<R2,R3>
         RSB
 
+; Map one SVAPTE/BOFF DCBE through the controller's private system-PTE window.
+; The caller runs in the serialized IOLOCK8 transmit worker, so no second CPU
+; or DP port can alter this window before the following copy completes.
+;
+; Input:  R1 = DCBE, R6 = DPCB
+; Output: R0 = status, R1 = contiguous system virtual address on success
+; Preserved: R2-R11
+
+DP_VCI_MAP_DCBE:
+        PUSHR   #^M<R2,R3,R4,R5,R7,R8,R9,R10,R11>
+        MOVL    DCBE$L_SVAPTE(R1),R2
+        BNEQ    10$
+        BRW     90$
+10$:    BITL    #<DP_VAX_PTE_SIZE-1>,R2
+        BEQL    11$
+        BRW     90$
+11$:    TSTL    R2
+        BLSS    12$
+        BRW     90$
+12$:    MOVL    DCBE$L_BOFF(R1),R7
+        MOVL    DCBE$L_BCNT(R1),R8
+        BNEQ    13$
+        BRW     90$
+
+; Advance over whole input pages and retain only the byte offset in the first
+; mapped page.  EXTZV performs the required unsigned shift for a 32-bit BOFF.
+
+13$:    EXTZV   #DP_VAX_PAGE_SHIFT,-
+                #<32-DP_VAX_PAGE_SHIFT>,R7,R9
+        ASHL    #2,R9,R9
+        ADDL2   R9,R2
+        BCC     14$
+        BRW     90$
+14$:    BICL3   #^C<DP_VAX_PAGE_MASK>,R7,R7
+        ADDL3   R7,R8,R0
+        BCC     15$
+        BRW     90$
+15$:    DECL    R0
+        ASHL    #-DP_VAX_PAGE_SHIFT,R0,R0
+        INCL    R0
+        CMPL    R0,DPCB_L_VCI_MAP_COUNT(R6)
+        BLEQU   16$
+        BRW     90$
+16$:    MOVL    DPCB_L_VCI_MAP_SVAPTE(R6),R4
+        BNEQ    17$
+        BRW     90$
+17$:    MOVL    DPCB_L_VCI_MAP_SVA(R6),R5
+        BNEQ    20$
+        BRW     90$
+
+; A valid VAX PTE is negative because PTE$M_VALID is the high bit.  The
+; executive conversion handles transition and global PTEs and bugchecks an
+; invalid I/O PTE, matching the native LAN-driver contract.  Re-extract the
+; PFN in both cases before building a kernel-read output PTE.
+
+20$:    MOVL    (R2)+,R3
+        TSTL    R3
+        BLSS    21$
+        JSB     G^IOC$PTETOPFN
+        INCL    DPCB_L_VCI_MAP_TRANSLATE_COUNT(R6)
+21$:    EXTZV   #PTE$V_PFN,#PTE$S_PFN,R3,R3
+        BISL3   #<PTE$M_VALID!PTE$C_KR>,R3,(R4)+
+        MTPR    R5,S^#PR$_TBIS
+        ADDL    #DP_VAX_PAGE_SIZE,R5
+        SOBGTR  R0,20$
+
+        ADDL3   DPCB_L_VCI_MAP_SVA(R6),R7,R1
+        INCL    DPCB_L_VCI_MAP_USE_COUNT(R6)
+        MOVZWL  #SS$_NORMAL,R0
+        BRW     95$
+90$:    CLRL    R1
+        MOVZWL  #SS$_BADPARAM,R0
+95$:    POPR    #^M<R2,R3,R4,R5,R7,R8,R9,R10,R11>
+        RSB
+
+; Append every validated DCBE to the already initialized staging buffer.
+; Direct SVA segments copy immediately; SVAPTE segments use the temporary map
+; above.  R2 is the VCRP, R6 the DPCB, R9 the staging-buffer base, and R11 the
+; number of embedded bytes already copied.  All inputs are preserved.
+
+DP_VCI_COPY_TX_CHAIN:
+        TSTL    VCRP$A_DCB_LINK(R2)
+        BNEQ    1$
+        MOVZWL  #SS$_NORMAL,R0
+        RSB
+1$:
+        PUSHR   #^M<R2,R3,R4,R5,R7,R8,R9,R10,R11>
+        MOVL    VCRP$A_DCB_LINK(R2),R10
+20$:    MOVL    DCBE$L_BCNT(R10),R8
+        BNEQ    21$
+        BRW     90$
+21$:    MOVL    DCBE$A_DCB_LINK(R10),R7
+        MOVL    DCBE$L_BUFFER_ADDRESS(R10),R1
+        BNEQ    22$
+        MOVL    R10,R1
+        BSBW    DP_VCI_MAP_DCBE
+        BLBS    R0,22$
+        BRW     95$
+22$:    ADDL3   R9,R11,R3
+        MOVL    R8,R0
+        MOVC3   R0,(R1),(R3)
+        ADDL2   R8,R11
+        MOVL    R7,R10
+        BEQL    23$
+        BRW     20$
+23$:    MOVZWL  #SS$_NORMAL,R0
+        BRW     95$
+90$:    MOVZWL  #SS$_BADPARAM,R0
+95$:    POPR    #^M<R2,R3,R4,R5,R7,R8,R9,R10,R11>
+        RSB
+
 DP_VCI_WORKER_TRANSMIT:
-        BSBW    DP_ENSURE_CONTROLLER_MAC
-        BLBS    R0,50$
-        CLRL    R1
-        BRW     DP_VCI_WORKER_COMPLETE
-50$:    MOVL    DPCB_L_VCI_ACTIVE_VCRP(R6),R2
+        MOVL    DPCB_L_VCI_ACTIVE_VCRP(R6),R2
         MOVL    VCRP$Q_LAN_T_DEST(R2),DPCB_B_VCI_TX_BUFFER(R6)
         MOVW    VCRP$Q_LAN_T_DEST+4(R2),DPCB_B_VCI_TX_BUFFER+4(R6)
         MOVL    DPCB_B_MAC_REPLY(R6),DPCB_B_VCI_TX_BUFFER+6(R6)
@@ -3986,9 +4169,9 @@ DP_VCI_WORKER_TRANSMIT:
         MOVW    UCB_W_DP_PORT_PTY(R3),DPCB_B_VCI_TX_BUFFER+12(R6)
 
 ; MOVC5 copies the embedded payload and zero-fills the rest of the physical
-; frame.  If a direct-SVA DCBE follows, MOVC3 overlays its bytes immediately
-; after the embedded segment.  The completion byte count follows native LAN
-; drivers and includes physical Ethernet padding.
+; frame.  The bounded chain copier then overlays all direct-SVA or SVAPTE
+; segments.  The completion byte count follows native LAN drivers and includes
+; physical Ethernet padding.
 
         MOVL    VCRP$L_TOTAL_PDU_SIZE(R2),R0
         ADDL3   #DP_ETH_HEADER,R0,R7
@@ -4001,17 +4184,16 @@ DP_VCI_WORKER_TRANSMIT:
         MOVL    VCRP$L_BCNT(R2),R0
         MOVL    R0,R11
         ADDL3   VCRP$L_BOFF(R2),R2,R1
-        MOVL    VCRP$A_DCB_LINK(R2),R10
         PUSHR   #^M<R2,R3,R4,R5>
         MOVC5   R0,(R1),#0,R8,(R9)
-        TSTL    R10
+        POPR    #^M<R2,R3,R4,R5>
+        TSTL    VCRP$A_DCB_LINK(R2)
         BEQL    511$
-        MOVL    DCBE$L_BCNT(R10),R0
-        BEQL    511$
-        MOVL    DCBE$L_BUFFER_ADDRESS(R10),R1
-        ADDL3   R9,R11,R3
-        MOVC3   R0,(R1),(R3)
-511$:   POPR    #^M<R2,R3,R4,R5>
+        BSBW    DP_VCI_COPY_TX_CHAIN
+        BLBS    R0,511$
+        CLRL    R1
+        BRW     DP_VCI_WORKER_COMPLETE
+511$:
         BRW     DP_VCI_WORKER_TRANSMIT_SEND
 
 ; TRANSMIT_FRAME already includes the static Ethernet header.  Copy the full
@@ -4019,11 +4201,7 @@ DP_VCI_WORKER_TRANSMIT:
 ; minimum-frame padding without changing the upper-owned VCRP descriptor.
 
 DP_VCI_WORKER_TRANSMIT_FRAME:
-        BSBW    DP_ENSURE_CONTROLLER_MAC
-        BLBS    R0,54$
-        CLRL    R1
-        BRW     DP_VCI_WORKER_COMPLETE
-54$:    MOVL    DPCB_L_VCI_ACTIVE_VCRP(R6),R2
+        MOVL    DPCB_L_VCI_ACTIVE_VCRP(R6),R2
         MOVL    VCRP$L_TOTAL_PDU_SIZE(R2),R7
         CMPL    R7,#DP_TX_MIN
         BGEQU   55$
@@ -4033,17 +4211,16 @@ DP_VCI_WORKER_TRANSMIT_FRAME:
         MOVL    VCRP$L_BCNT(R2),R0
         MOVL    R0,R11
         ADDL3   VCRP$L_BOFF(R2),R2,R1
-        MOVL    VCRP$A_DCB_LINK(R2),R10
         PUSHR   #^M<R2,R3,R4,R5>
         MOVC5   R0,(R1),#0,R7,(R9)
-        TSTL    R10
+        POPR    #^M<R2,R3,R4,R5>
+        TSTL    VCRP$A_DCB_LINK(R2)
         BEQL    551$
-        MOVL    DCBE$L_BCNT(R10),R0
-        BEQL    551$
-        MOVL    DCBE$L_BUFFER_ADDRESS(R10),R1
-        ADDL3   R9,R11,R3
-        MOVC3   R0,(R1),(R3)
-551$:   POPR    #^M<R2,R3,R4,R5>
+        BSBW    DP_VCI_COPY_TX_CHAIN
+        BLBS    R0,551$
+        CLRL    R1
+        BRW     DP_VCI_WORKER_COMPLETE
+551$:
         MOVL    VCRP$Q_LAN_T_DEST(R2),DPCB_B_VCI_TX_BUFFER(R6)
         MOVW    VCRP$Q_LAN_T_DEST+4(R2),DPCB_B_VCI_TX_BUFFER+4(R6)
 
@@ -4056,9 +4233,21 @@ DP_VCI_WORKER_TRANSMIT_SEND:
 562$:
         MOVAL   DP_WRITE_CDB,R2
         BSBW    DP_PREPARE_VCI_TX
-        BLBC    R0,52$
+        BLBS    R0,563$
+        BRW     52$
+563$:
         BSBW    DP_SET_CDB_LENGTH
         BSBW    DP_SEND_COMMAND
+        SUBL3   SCDRP$L_PAD_BCNT(R5),-
+                SCDRP$L_TRANS_CNT(R5),R1
+        MOVL    R1,DPCB_L_VCI_TX_LAST_TRANSFER(R6)
+        BLBS    R0,564$
+        BRW     52$
+564$:
+        CMPL    R1,DPCB_L_VCI_TX_LENGTH(R6)
+        BEQL    52$
+        INCL    DPCB_L_VCI_TX_SHORT_COUNT(R6)
+        MOVZWL  #SS$_OPINCOMPL,R0
 52$:    PUSHL   R0
         BSBW    DP_CLEANUP_COMMAND
         POPL    R0

@@ -1,4 +1,4 @@
-DaynaPORT SCSI/Link driver V0.62 for OpenVMS VAX V7.3
+DaynaPORT SCSI/Link driver V0.68 for OpenVMS VAX V7.3
 ======================================================
 
 1. Scope and tested environment
@@ -31,7 +31,7 @@ structures.  It deliberately does not load, connect, or execute the driver.
 3. SYSGEN USER4 receive-pool parameter
 --------------------------------------
 
-V0.62 reads the site-reserved static SYSGEN parameter USER4 once during
+V0.68 reads the site-reserved static SYSGEN parameter USER4 once during
 controller initialization.  USER4 is system-wide and is not a private
 DaynaPORT namespace.  Before assigning it, verify that no other local product
 or site procedure uses USER4.
@@ -79,9 +79,10 @@ TCPIP$STARTUP.COM:
 
   $ @SYS$STARTUP:DAYNAPORT$STARTUP.COM
 
-The order is required: the procedure connects XQA0, obtains the adapter MAC
-address, and installs the VCI discovery hook before TCP/IP Services discovers
-QE0.  It does not alter persistent TCP/IP data.
+The order is required: the procedure connects XQA0 and issues one privileged
+control request.  The driver obtains the adapter MAC in ordinary STARTIO and
+then installs the VCI discovery hook before TCP/IP Services discovers QE0.
+It does not alter persistent TCP/IP data.
 
 After a controlled reboot, verify:
 
@@ -109,4 +110,4 @@ disk backup until the post-removal boot has been verified.
 -----------------------------
 
 The software is licensed under the MIT License; see
-SYS$HELP:DAYNAPORT$LICENSE.TXT.  V0.62 is experimental and has no warranty.
+SYS$HELP:DAYNAPORT$LICENSE.TXT.  V0.68 is experimental and has no warranty.

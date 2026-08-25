@@ -5,9 +5,11 @@
 *.LOG
 *.DIA
 *.PCSI
-!dist/CHATGPT56-VAXVMS-DAYNAPORT-V0062--1.PCSI
+!dist/CHATGPT56-VAXVMS-DAYNAPORT-V0068--1.PCSI
 *.DMP
 *.ISO
 *.RAR
 *.iso
 *.rar
+.private/
+tests/

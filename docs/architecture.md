@@ -98,8 +98,9 @@ this class driver.
 
 The first ordinary STARTIO request sends DaynaPORT command `0x09`, validates
 the 18-byte response, and caches the first six bytes as the hardware address.
-The supplied `DP_MAC_INIT` utility creates this ordinary request before the
-VCI wrappers are installed.
+`DP_VCI_CONTROL INSTALL` creates that request. The driver completes MAC
+discovery before it publishes the VCI wrappers, so no separate MAC utility is
+required.
 
 ### VCI installation
 
@@ -263,12 +264,12 @@ The design prefers rejection over partial state:
 - controller work is serialized rather than rejected because another command
   is active.
 
-The startup procedure stops on a failed connect, MAC discovery, hook install,
-or DHCP activation. It does not attempt destructive recovery.
+The startup procedure stops on a failed connect, combined MAC/hook
+preparation, or DHCP activation. It does not attempt destructive recovery.
 
 ## Tested boundaries
 
-The V0.61 packet-I/O build has been tested with:
+The V0.68 packet-I/O build has been tested with:
 
 - automatic boot-time XQA0 connection;
 - a 32-entry default receive pool selected by `USER4=0`;
@@ -282,8 +283,8 @@ exhaustion, and reported zero QE0 send/receive errors. TCP receive-side
 reordering remained visible, so the architecture should not be considered
 performance-complete.
 
-V0.62 changes no packet-I/O behavior. Its release boundary was tested with a
-clean native assembly/link/image-analysis gate followed by PCSI V7.3-100
-packaging and an installed-product upgrade from V0.61. The automatic and
-manual non-loading IVPs passed, and the installed common image identified as
-V0.62. The upgrade intentionally did not reload the resident driver.
+V0.68 bypasses the general chain-copy helper when an upper transmit request
+contains one contiguous data buffer. Chained direct-SVA and SVAPTE/BOFF input
+retains the bounded validation, mapping, and coalescing path introduced in
+V0.65. The V0.68 image passed native assembly, link, image analysis, clean
+boot, DHCP, and bounded live ICMP gates.

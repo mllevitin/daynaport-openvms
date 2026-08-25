@@ -54,7 +54,7 @@ int main(int argc, char **argv)
 
     if (action_is(action, "INSTALL", "install")) {
         magic = DP_VCI_CTL_INSTALL;
-        label = "install";
+        label = "prepare/install";
     } else if (action_is(action, "REMOVE", "remove")) {
         magic = DP_VCI_CTL_REMOVE;
         label = "remove";
@@ -98,6 +98,9 @@ int main(int argc, char **argv)
         return 4;
     }
 
-    printf("VCI callback %s completed.\n", label);
+    if (magic == DP_VCI_CTL_INSTALL)
+        printf("Hardware address cached; VCI callbacks installed.\n");
+    else
+        printf("VCI callback removal completed.\n");
     return 0;
 }

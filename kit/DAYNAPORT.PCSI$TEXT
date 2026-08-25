@@ -1,4 +1,4 @@
-=product CHATGPT56 VAXVMS DAYNAPORT V0.62 full
+=product CHATGPT56 VAXVMS DAYNAPORT V0.68 full
 1 'PRODUCT
 =prompt DaynaPORT SCSI/Link driver for OpenVMS VAX
 The DaynaPORT product presents a ZuluSCSI DaynaPORT target as an OpenVMS
@@ -15,11 +15,11 @@ The full license is installed as SYS$HELP:DAYNAPORT$LICENSE.TXT.
 The driver was written by chatgpt5.6-sol with the active participation,
 hardware, testing, and engineering direction of mlevitin.
 1 PREINSTALL
-=prompt Install the experimental DaynaPORT V0.62 files?
+=prompt Install the experimental DaynaPORT V0.68 files?
 This full kit is for OpenVMS VAX V7.3 and the ZuluSCSI DaynaPORT target.
 The tested target is SCSI ID 4, LUN 0, on a VAXstation 4000-90.
 
-Installation copies the driver, runtime utilities, startup procedure,
+Installation copies the driver, runtime control utility, startup procedure,
 documentation, and IVP.  It does not load or connect the driver, change
 SYSGEN parameters, edit SYSTARTUP_VMS.COM, or change TCP/IP configuration.
 1 POSTINSTALL

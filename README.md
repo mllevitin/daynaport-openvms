@@ -5,11 +5,11 @@ SCSI/Link Ethernet protocol implemented by ZuluSCSI. The loadable image
 presents the adapter as `XQA0:`; TCP/IP Services sees the corresponding
 Ethernet interface as `QE0`.
 
-The current version is V0.62. It is experimental system software: the V0.61
-packet-I/O implementation has been built and exercised on real hardware,
-including DHCP, ICMP, and bidirectional FTP, but it has not been qualified for
-production use. V0.62 changes no packet-I/O behavior; it adds the native PCSI
-distribution and a compiler-independent installation path.
+The current version is V0.68. It is experimental system software. The driver
+has been built and exercised on real hardware with DHCP, ICMP, full-size
+Ethernet frames, and bidirectional FTP, but it has not been qualified for
+production use. V0.68 adds a fast path for the common contiguous transmit
+buffer while retaining the complete bounded-chain path.
 
 ## Authorship
 
@@ -58,11 +58,10 @@ the ZuluSCSI terminator when an external terminator is already fitted.
 - `driver/DPDRIVER.MAR` — the loadable VAX driver.
 - `driver/DYDRIVER_VCI_PREFIX.MAR` — enables the XQA/QE identity and VCI
   frontend used by TCP/IP Services.
-- `src/dp_mac_init.c` — performs the deferred MAC initialization
-  required before publishing the interface.
 - `src/dp_vci_control.c` — privileged utility that installs or removes the
-  VCI callback wrappers.
-- `VMS_BUILD.COM` — builds the driver and both runtime utilities.
+  VCI callback wrappers; the install request also causes the driver to read
+  and cache the adapter MAC.
+- `VMS_BUILD.COM` — builds the driver and its runtime control utility.
 - `VMS_BUILD_PCSI.COM` — packages the built images as a sequential PCSI kit.
 - `VMS_DAYNAPORT_STARTUP.COM` — establishes the required boot order.
 - `kit/` — PCSI product metadata, installed startup procedure, safe IVP, and
@@ -91,14 +90,14 @@ Installing the prebuilt PCSI kit does not require MACRO-32, C, or LINK.
 
 ## Install the prebuilt PCSI kit
 
-The verified V0.62 full sequential kit is:
+The verified V0.68 full sequential kit is:
 
 ```text
-dist/CHATGPT56-VAXVMS-DAYNAPORT-V0062--1.PCSI
+dist/CHATGPT56-VAXVMS-DAYNAPORT-V0068--1.PCSI
 ```
 
 Its size is 40960 bytes and its SHA-256 is
-`dc6ba7c8d6df9c7df6f55b013c3d58d17544bcb95d812747c7716742515cc503`.
+`d293dd3cdfe69e7c5d399b1dbab318d662ebf6a8cc6141297602af6b55e55b52`.
 Copy it to the VAX in binary mode, set default to its directory, log in as
 SYSTEM, and run:
 
@@ -106,7 +105,7 @@ SYSTEM, and run:
 $ PRODUCT INSTALL DAYNAPORT /SOURCE=[] /HELP
 ```
 
-PCSI installs the prebuilt driver, both runtime utilities, startup procedure,
+PCSI installs the prebuilt driver, runtime control utility, startup procedure,
 safe IVP, installation guide, and license. The IVP validates files and image
 structure without loading the driver. Installation does not connect XQA0,
 change `USER4`, edit `SYSTARTUP_VMS.COM`, or configure TCP/IP. Read
@@ -125,7 +124,6 @@ The procedure produces:
 
 ```text
 DYDRIVER.EXE
-DP_MAC_INIT.EXE
 DP_VCI_CONTROL.EXE
 ```
 
@@ -184,9 +182,9 @@ console available.
 The recommended path is the prebuilt PCSI installation above. For a manual
 source build and installation, the high-level sequence is:
 
-1. Build the three images with `@VMS_BUILD.COM`.
+1. Build the two images with `@VMS_BUILD.COM`.
 2. Copy `DYDRIVER.EXE` to `SYS$LOADABLE_IMAGES:`.
-3. Copy the startup procedure and its two support images to one directory,
+3. Copy the startup procedure and its control utility to one directory,
    normally `SYS$MANAGER:`.
 4. Configure `QE0` in TCP/IP Services, using DHCP or a static address suitable
    for the DaynaPORT network.
@@ -203,8 +201,8 @@ before copying the driver into `SYS$LOADABLE_IMAGES:`.
 `VMS_DAYNAPORT_STARTUP.COM` performs this order:
 
 1. connect `XQA0:` to `DYDRIVER` if it is absent;
-2. issue one harmless driver request that reads and caches the adapter MAC;
-3. install the VCI wrapper set through a privileged, fail-closed control QIO;
+2. issue one privileged, fail-closed control QIO; its ordinary STARTIO path
+   reads and caches the adapter MAC before installing the VCI wrapper set;
 4. return so normal `TCPIP$STARTUP` can create and activate `QE0`;
 5. if TCP/IP is already running, activate a missing `QE0` using DHCP.
 
@@ -213,8 +211,8 @@ interface, remove a VCI hook, or shut down another network device.
 
 ## Current status and limitations
 
-V0.61 has passed native assembly/link/image analysis and repeated clean boot
-tests on the stated VAXstation. The unchanged packet-I/O path has completed:
+V0.68 has passed native assembly/link/image analysis and a clean boot test on
+the stated VAXstation. The packet-I/O path has completed:
 
 - automatic XQA0 connection and VCI publication;
 - DHCP configuration of QE0;
@@ -224,11 +222,17 @@ tests on the stated VAXstation. The unchanged packet-I/O path has completed:
 - zero receive-pool exhaustion with the 32-buffer default;
 - zero QE0 send and receive errors during the final bounded workload.
 
-V0.62 has passed a clean native build and PCSI V7.3-100 packaging gate. PCSI
-successfully upgraded the registered product from V0.61 to V0.62, and both the
-automatic and manual non-loading IVPs passed. The installed common driver
-identified as V0.62. This packaging gate deliberately did not replace or
-reload the resident node-specific V0.61 image; XQA0 and QE0 remained online.
+The V0.68 contiguous-frame fast path passed a bounded live ICMP gate with
+XQA0 and DHCP-configured QE0 online. The driver recorded no interface errors,
+no receive-pool exhaustion, and equal ownership handoffs for returned receive
+buffers. Occasional physical-path loss remains observable on the
+ZuluSCSI/Wi-Fi link and is not hidden by the driver.
+
+The V0.68 PCSI kit upgraded an installed V0.62 product on OpenVMS VAX V7.3.
+Its automatic and manual IVPs passed. After an orderly reboot using shutdown
+option `NONE`, the kit image connected XQA0, published QE0, obtained the DHCP
+address `192.168.4.12`, and completed bidirectional ICMP with zero XQA0/QE0
+device errors.
 
 Known limitations:
 
